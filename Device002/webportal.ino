@@ -929,12 +929,18 @@ String generateMainPage() {
   html += "</tr>";
   
   html += "<tr>";
-  html += "<td>Compressor Level</td>";
+  html += "<td>Compressor On Level</td>";
   html += "<td>" + String(config.compressorOnLevel, 1) + "</td>";
   html += "<td><input type='number' step='0.1' name='compressorOnLevel' value='" + String(config.compressorOnLevel, 1) + "' style='width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px;'></td>";
   html += "<td>cm</td>";
   html += "</tr>";
-  
+    
+  html += "<tr>";
+  html += "<td>Compressor Off Level</td>";
+  html += "<td>" + String(config.compressorOffLevel, 1) + "</td>";
+  html += "<td><input type='number' step='0.1' name='compressorOffLevel' value='" + String(config.compressorOffLevel, 1) + "' style='width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px;'></td>";
+  html += "<td>cm</td>";
+  html += "</tr>";
   html += "<tr>";
   html += "<td>Publish Interval</td>";
   html += "<td>" + String(config.publishInterval / 60000) + "</td>";
