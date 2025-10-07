@@ -101,6 +101,8 @@ struct Config {
   float humidityThresholdMin;
   float humidityThresholdMax;
   float compressorOnLevel;
+  
+  float compressorOffLevel;
   int   publishInterval;
 
   // 🔥 Add OTA params
@@ -212,6 +214,8 @@ TaskHandle_t checkRelayTaskHandle;
 TaskHandle_t checkConnectivityTaskHandle;
 TaskHandle_t buttonCheckTaskHandle;
 TaskHandle_t flowSensorTaskHandle;
+TaskHandle_t phTaskHandle;
+TaskHandle_t sensorAvgTaskHandle;
 const float vRef = 3.3;
 const float adcResolution = 4095;
 unsigned long lastPublishTime = 0;
@@ -235,7 +239,7 @@ SHTSensor sht;
     uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "1.3.6";
+const char* current_firmware_version = "1.3.7";
 
 void IRAM_ATTR countPulses() {
   pulseCount++;
@@ -324,7 +328,7 @@ loadConfig();
   xTaskCreatePinnedToCore(buttonCheckTask, "Button Check Task", 6144, NULL, 1, &buttonCheckTaskHandle, 0);
   xTaskCreatePinnedToCore(flowSensorTask, "Flow Sensor Task", 4096, NULL, 1, &flowSensorTaskHandle, 0);
 
-  xTaskCreatePinnedToCore(sensorAvgTask, "Sensor Average Task", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(sensorAvgTask, "Sensor Average Task", 4096, NULL, 1, &sensorAvgTaskHandle, 1);
   setupCommunication();
   measureUltrasonicDistance();
   LOG_DEBUG("Ultrasonic distance: %d cm", distance);
@@ -375,8 +379,10 @@ void buttonCheckTask(void* pvParameters) {
 }
 void phTdsTask(void* pvParameters) {
   unsigned long startTime = millis();
+  LOG_INFO("pH/TDS Task started at %lu ms", startTime);
 
   // Initial wait 3s
+  LOG_DEBUG("Waiting 3 seconds before validating flow...");
   vTaskDelay(3000 / portTICK_PERIOD_MS);
 
   // If flow ended during first 3s → exit without reading
@@ -387,6 +393,7 @@ void phTdsTask(void* pvParameters) {
   }
 
   // Wait until at least 10s of continuous flow
+  LOG_DEBUG("Checking continuous flow for 10 seconds...");
   while (millis() - startTime < 10000) {
     if (!flowFlag) {
       LOG_WARN("Flow ended before 10s → skipping pH/TDS read");
@@ -395,16 +402,19 @@ void phTdsTask(void* pvParameters) {
     }
     vTaskDelay(500 / portTICK_PERIOD_MS);
   }
+  LOG_INFO("Continuous flow detected ≥10s → proceeding with readings");
 
-  // ✅ At this point, flow has been ON for ≥10s → do readings
   float tdsReading = NAN;
   float phReading  = NAN;
 
   // --- Retry loop for TDS ---
   for (int i = 0; i < 3; i++) {
+    LOG_DEBUG("Reading TDS attempt %d...", i+1);
     readTDSSensor(25.0);
+    LOG_DEBUG("Raw TDS value: %.2f", tdsValue);
     if (tdsValue >= 0 && tdsValue <= 2000) {
       tdsReading = tdsValue;
+      LOG_INFO("Valid TDS reading: %.2f ppm", tdsReading);
       break;
     }
     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -412,9 +422,12 @@ void phTdsTask(void* pvParameters) {
 
   // --- Retry loop for pH ---
   for (int i = 0; i < 3; i++) {
+    LOG_DEBUG("Reading pH attempt %d...", i+1);
     readPHSensor();
+    LOG_DEBUG("Raw pH value: %.2f", phValue);
     if (phValue > 0.0 && phValue <= 14.0) {
       phReading = phValue;
+      LOG_INFO("Valid pH reading: %.2f", phReading);
       break;
     }
     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -424,21 +437,13 @@ void phTdsTask(void* pvParameters) {
   saveCounter("tdsValue", isnan(tdsReading) ? NAN : tdsReading);
   saveCounter("phValue",  isnan(phReading)  ? NAN : phReading);
 
-  if (isnan(tdsReading)) {
-    LOG_WARN("TDS invalid after retries → stored NULL");
-  } else {
-    LOG_INFO("TDS stored: %.2f ppm", tdsReading);
-  }
-
-  if (isnan(phReading)) {
-    LOG_WARN("pH invalid after retries → stored NULL");
-  } else {
-    LOG_INFO("pH stored: %.2f", phReading);
-  }
+  if (isnan(tdsReading)) LOG_WARN("TDS invalid after retries → stored NULL");
+  if (isnan(phReading))  LOG_WARN("pH invalid after retries → stored NULL");
 
   LOG_INFO("pH/TDS task finished → deleting itself");
   vTaskDelete(NULL);
 }
+
 
 
 
@@ -473,13 +478,13 @@ void flowSensorTask(void* pvParameters) {
   xTaskCreatePinnedToCore(
     phTdsTask,
     "phTdsTask",
-    512,   // stack size
+    4096,   // stack size
     NULL,
     1,
-    NULL,
+    &phTaskHandle,
     1
   );
-}
+  }
 
     } 
     else if (flowFlag && (millis() - lastFlowTime >= flowStopDelay)) {
@@ -501,6 +506,8 @@ void flowSensorTask(void* pvParameters) {
       LOG_INFO("Flow duration: %lu minutes", flowDurationMinutes);
       LOG_INFO("Cumulative motor minutes: %lu", motorMinutes);
     }
+    LOG_DEBUG("Pulse count: %lu → FlowRate: %.2f L/min, Added: %.3f L, Total: %.2f L",
+              currentPulseCount, flowRate, totalLiters1/10, totalLiters);
 
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
@@ -523,20 +530,27 @@ void checkRelayTask(void* pvParameters) {
     measureUltrasonicDistance();
     getLatestAverages(temperature, humidity, AQI, TVOC, ECO2);
 
-    bool tempOk = (temperature >= config.tempThresholdMin && temperature <= config.tempThresholdMax);
-    bool humOk  = (humidity   >= config.humidityThresholdMin && humidity   <= config.humidityThresholdMax);
+    // --- Validate base sensor ranges first ---
+    bool tempValid = (!isnan(temperature) && temperature >= -40 && temperature <= 125 && temperature != 0.0);
+    bool humValid  = (!isnan(humidity)    && humidity >= 0   && humidity <= 100);
+
+    bool tempOk = tempValid &&
+                  (temperature >= config.tempThresholdMin && temperature <= config.tempThresholdMax);
+
+    bool humOk  = humValid &&
+                  (humidity   >= config.humidityThresholdMin && humidity   <= config.humidityThresholdMax);
 
     // --- OFF conditions ---
-    if (distance <= 6 || !tempOk || !humOk) {
+    if (distance <= config.compressorOffLevel || !tempOk || !humOk) {
       if (lastRelayState != HIGH) {
-        // No need to add duration here → already handled by per-minute increments
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
-        compStartTime = 0;  // clear ON session baseline
+        compStartTime = 0;
 
-        LOG_INFO("Relay OFF → Compressor stopped (Reason: %s)",
-                 distance <= 6 ? "Tank full" : "Temp/Humidity out of range");
+        LOG_WARN("Relay OFF → Compressor stopped (Reason: %s)",
+                 distance <= 6 ? "Tank full" :
+                 (!tempValid || !humValid ? "Invalid sensor data" : "Threshold exceeded"));
       }
     }
     // --- ON conditions ---
@@ -554,7 +568,7 @@ void checkRelayTask(void* pvParameters) {
       }
     }
 
-    // --- Per-minute accumulation while running ---
+    // --- Per-minute accumulation ---
     if (lastRelayState == LOW && (millis() - lastMinuteCheck >= 60000)) {
       compressorMinutes++;
       saveCounterULong("compMinutes", compressorMinutes);
@@ -562,9 +576,15 @@ void checkRelayTask(void* pvParameters) {
       LOG_DEBUG("Compressor runtime incremented: %lu minutes", compressorMinutes);
     }
 
+    LOG_DEBUG("CheckRelay loop → Temp: %.2f (%.2f-%.2f) | Hum: %.2f (%.2f-%.2f) | Distance: %d",
+              temperature, config.tempThresholdMin, config.tempThresholdMax,
+              humidity, config.humidityThresholdMin, config.humidityThresholdMax,
+              distance);
+
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
+
 void saveCounter(const char* key, float value) {
   if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
     prefs.begin("counters", false);  // write mode
@@ -650,6 +670,8 @@ void sensorAvgTask(void *pvParameters) {
 
       xSemaphoreGive(sensorMutex);
     }
+  LOG_DEBUG("SHT → Temp: %.2f, Hum: %.2f | ENS160 → AQI: %d, TVOC: %u, eCO2: %u",
+          temperature, humidity, aqi, tvoc, eco2);
 
     // ✅ Delay exactly 1 minute
     vTaskDelay(60000 / portTICK_PERIOD_MS);
@@ -1234,6 +1256,20 @@ void sendViaGSM() {
   // Pull the latest averages
   if (!getLatestAverages(temperature, humidity, AQI, TVOC, ECO2)) {
     LOG_WARN("No averages ready yet.");
+    // --- Read SHT sensor ---
+    if (sht.readSample()) {
+      temperature = sht.getTemperature();
+      humidity    = sht.getHumidity();
+    }
+
+    // --- Read ENS160 sensor ---
+    int status = ens160.getENS160Status();
+    if (status == 1) {
+      AQI  = ens160.getAQI();
+      TVOC = ens160.getTVOC();
+      ECO2 = ens160.getECO2();
+    }
+
   }
 
   // ✅ Range validations
@@ -1258,7 +1294,7 @@ void sendViaGSM() {
   if (AQI < 1 || AQI > 5) doc["AQI"] = nullptr;
   else doc["AQI"] = AQI;
 
-  if (TVOC < 1 || TVOC > 65000) doc["TVOC"] = nullptr;
+  if (TVOC < 0 || TVOC > 65000) doc["TVOC"] = nullptr;
   else doc["TVOC"] = TVOC;
 
   if (ECO2 < 400 || ECO2 > 65000) doc["ECO2"] = nullptr;
@@ -1801,6 +1837,8 @@ void saveConfig() {
   prefs.putFloat("humMin", config.humidityThresholdMin);
   prefs.putFloat("humMax", config.humidityThresholdMax);
   prefs.putFloat("compLevel", config.compressorOnLevel);
+  
+  prefs.putFloat("compoffLevel", config.compressorOffLevel);
   prefs.putInt("publishInterval", config.publishInterval);
 
   prefs.end();
@@ -1844,6 +1882,8 @@ void loadConfig() {
   config.humidityThresholdMin = prefs.getFloat("humMin", 0);
   config.humidityThresholdMax = prefs.getFloat("humMax", 0);
   config.compressorOnLevel  = prefs.getFloat("compLevel", 0);
+  
+  config.compressorOffLevel  = prefs.getFloat("compoffLevel", 0);
   config.publishInterval    = prefs.getInt("publishInterval", 60000);
 
   // Load OTA credentials
@@ -1871,6 +1911,8 @@ void loadConfig() {
   Serial.print("humMin: "); Serial.println(config.humidityThresholdMin);
   Serial.print("humMax: "); Serial.println(config.humidityThresholdMax);
   Serial.print("compLevel: "); Serial.println(config.compressorOnLevel);
+  
+  Serial.print("compofffLevel: "); Serial.println(config.compressorOffLevel);
   Serial.print("publishInterval: "); Serial.println(config.publishInterval);
 
   // OTA creds
@@ -1946,6 +1988,10 @@ void handleThresholdSave() {
   }
   if (server.hasArg("compressorOnLevel")) {
     config.compressorOnLevel = server.arg("compressorOnLevel").toFloat();
+    updated = true;
+  }
+   if (server.hasArg("compressorOffLevel")) {
+    config.compressorOffLevel = server.arg("compressorOffLevel").toFloat();
     updated = true;
   }
   if (server.hasArg("publishInterval")) {
