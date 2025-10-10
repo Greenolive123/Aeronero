@@ -760,7 +760,7 @@ String generateMainPage() {
   
   html += "<div class='metric-card " + String(distance < 3 || distance > 500 ? "invalid" : "valid") + "'>";
   html += "<div class='metric-label'>Water Level</div>";
-  html += "<div class='metric-value'>" + String(distance, 1) + " cm</div>";
+  html += "<div class='metric-value'>" + String(distance) + " cm</div>";
   html += "<span class='metric-status " + String(distance < 3 || distance > 500 ? "status-error'>Out of Range" : "status-ok'>Normal") + "</span>";
   html += "</div>";
   

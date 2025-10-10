@@ -128,7 +128,7 @@ const int dataStatus = 15;
 const int tdsPin = 2;
 const int RESET_PIN = 36;
 const int flowSensorPin = 5;
-#define PH_PIN 1
+#define PH_PIN 4   //device002
 #define ADC_RESOLUTION 4096
 #define VREF 3300
 #define V_NEUTRAL 1500
@@ -188,11 +188,12 @@ void logMessage(uint8_t level, const char* format, ...) {
 float neutralADC = 1925;
 float acidADC = 2269;
 float temperatureC = 25.0;
-const int SAMPLES = 25;
+const int SAMPLES = 100;
 const int SAMPLE_DELAY_MS = 20;
 
 float slope25() {
-  return (7.0 - 4.0) / (neutralADC - acidADC);
+    // slope = (pH7 - pH4) / (ADC@7 - ADC@4)
+    return (7.0 - 4.0) / (neutralADC - acidADC);
 }
 
 SemaphoreHandle_t prefsMutex;
@@ -215,7 +216,7 @@ TaskHandle_t checkConnectivityTaskHandle;
 TaskHandle_t buttonCheckTaskHandle;
 TaskHandle_t flowSensorTaskHandle;
 TaskHandle_t phTaskHandle;
-TaskHandle_t sensorAvgTaskHandle;
+// TaskHandle_t sensorAvgTaskHandle;
 const float vRef = 3.3;
 const float adcResolution = 4095;
 unsigned long lastPublishTime = 0;
@@ -223,7 +224,8 @@ unsigned long lastPublishTime = 0;
 #define gsmTX 18
 #define gsmRST 14
 // #define gsmRST 48
-
+bool shtInitialized = false;
+bool ensInitialized = false;
 const float tdsFactor = 0.5;
 unsigned long lastRelayOffTime = 0;
 volatile uint32_t pulseCount = 0;
@@ -239,7 +241,7 @@ SHTSensor sht;
     uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "1.3.7";
+const char* current_firmware_version = "1.4.1";
 
 void IRAM_ATTR countPulses() {
   pulseCount++;
@@ -273,6 +275,7 @@ void setup() {
   LOG_INFO("Starting system initialization...");
   Serial.println(current_firmware_version);
   delay(1000);
+    delay(1000);
   sensorSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
 
   pinMode(gsmRST, OUTPUT);
@@ -296,39 +299,19 @@ void setup() {
 prefsMutex = xSemaphoreCreateMutex();
   attachInterrupt(digitalPinToInterrupt(flowSensorPin), countPulses, RISING);
 loadConfig();
-  LOG_INFO("Initializing SHT20 Sensor...");
-  if (sht.init()) {
-    LOG_INFO("SHT20 initialization successful");
-  } else {
-    LOG_ERROR("SHT20 initialization failed");
-  }
-  sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
+  delay(1000);
+  
   measureUltrasonicDistance();
   LOG_INFO("Initializing ENS160 Sensor...");
-  int attempt = 0;
-  while (attempt < 5) {
-    if (NO_ERR == ens160.begin()) {
-      LOG_INFO("ENS160 initialization successful!");
-      break;
-    } else {
-      LOG_WARN("ENS160 communication failed, attempt %d/5", attempt + 1);
-      attempt++;
-      delay(3000);
-    }
-  }
-  if (attempt == 5) {
-    LOG_ERROR("Failed to initialize ENS160 after 5 attempts");
-    isENS = false;
-  }
-  ens160.setPWRMode(ENS160_STANDARD_MODE);
-  delay(5000);
+  initSensors();
+  delay(3000);
 
- sensorMutex = xSemaphoreCreateMutex();
+  sensorMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(checkRelayTask, "Check Relay Task", 6144, NULL, 1, &checkRelayTaskHandle, 1);
   xTaskCreatePinnedToCore(buttonCheckTask, "Button Check Task", 6144, NULL, 1, &buttonCheckTaskHandle, 0);
   xTaskCreatePinnedToCore(flowSensorTask, "Flow Sensor Task", 4096, NULL, 1, &flowSensorTaskHandle, 0);
 
-  xTaskCreatePinnedToCore(sensorAvgTask, "Sensor Average Task", 4096, NULL, 1, &sensorAvgTaskHandle, 1);
+  // xTaskCreatePinnedToCore(sensorAvgTask, "Sensor Average Task", 4096, NULL, 1, &sensorAvgTaskHandle, 1);
   setupCommunication();
   measureUltrasonicDistance();
   LOG_DEBUG("Ultrasonic distance: %d cm", distance);
@@ -352,6 +335,42 @@ loadConfig();
   }
 }
 
+
+bool initSensors() {
+  LOG_INFO("Initializing SHT20 Sensor...");
+  if (sht.init()) {
+    LOG_INFO("SHT20 initialization successful");
+    sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
+    shtInitialized = true;
+  } else {
+    LOG_ERROR("SHT20 initialization failed");
+    shtInitialized = false;
+  }
+
+  LOG_INFO("Initializing ENS160 Sensor...");
+  int attempt = 0;
+  while (attempt < 5) {
+    if (NO_ERR == ens160.begin()) {
+      LOG_INFO("ENS160 initialization successful!");
+      ensInitialized = true;
+      break;
+    } else {
+      LOG_WARN("ENS160 communication failed, attempt %d/5", attempt + 1);
+      attempt++;
+      delay(3000);
+    }
+  }
+
+  if (!ensInitialized) {
+    LOG_ERROR("Failed to initialize ENS160 after 5 attempts");
+    isENS = false;
+  } else {
+    ens160.setPWRMode(ENS160_STANDARD_MODE);
+    delay(5000);
+  }
+
+  return shtInitialized && ensInitialized;
+}
 void loop() {
   monitorMemory();
   vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -377,74 +396,109 @@ void buttonCheckTask(void* pvParameters) {
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
+
+
+// ------------------- pH / TDS TASK -------------------
+// ------------------- pH / TDS TASK -------------------
 void phTdsTask(void* pvParameters) {
-  unsigned long startTime = millis();
-  LOG_INFO("pH/TDS Task started at %lu ms", startTime);
+    unsigned long startTime = millis();
+    LOG_INFO("🧪 pH/TDS Task started at %lu ms", startTime);
 
-  // Initial wait 3s
-  LOG_DEBUG("Waiting 3 seconds before validating flow...");
-  vTaskDelay(3000 / portTICK_PERIOD_MS);
-
-  // If flow ended during first 3s → exit without reading
-  if (!flowFlag) {
-    LOG_WARN("Flow stopped before 3s → skipping pH/TDS read");
-    vTaskDelete(NULL);
-    return;
-  }
-
-  // Wait until at least 10s of continuous flow
-  LOG_DEBUG("Checking continuous flow for 10 seconds...");
-  while (millis() - startTime < 5000) {
     if (!flowFlag) {
-      LOG_WARN("Flow ended before 10s → skipping pH/TDS read");
-      vTaskDelete(NULL);
-      return;
+        LOG_WARN("⚠️ Flow stopped before 3s → skipping pH/TDS read");
+        vTaskDelete(NULL);
+        return;
     }
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-  LOG_INFO("Continuous flow detected ≥10s → proceeding with readings");
 
-  float tdsReading = NAN;
-  float phReading  = NAN;
-
-  // --- Retry loop for TDS ---
-  for (int i = 0; i < 3; i++) {
-    LOG_DEBUG("Reading TDS attempt %d...", i+1);
-    readTDSSensor(25.0);
-    LOG_DEBUG("Raw TDS value: %.2f", tdsValue);
-    if (tdsValue >= 0 && tdsValue <= 2000) {
-      tdsReading = tdsValue;
-      LOG_INFO("Valid TDS reading: %.2f ppm", tdsReading);
-      break;
+    LOG_DEBUG("Checking continuous flow for 5 seconds...");
+    while (millis() - startTime < 5000) {
+        if (!flowFlag) {
+            LOG_WARN("⚠️ Flow ended before 5s → skipping pH/TDS read");
+            vTaskDelete(NULL);
+            return;
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
     }
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
 
-  // --- Retry loop for pH ---
-  for (int i = 0; i < 3; i++) {
-    LOG_DEBUG("Reading pH attempt %d...", i+1);
-    readPHSensor();
-    LOG_DEBUG("Raw pH value: %.2f", phValue);
-    if (phValue > 0.0 && phValue <= 14.0) {
-      phReading = phValue;
-      LOG_INFO("Valid pH reading: %.2f", phReading);
-      break;
+    LOG_INFO("✅ Continuous flow detected ≥5s → waiting 10s for stabilization...");
+    vTaskDelay(10000 / portTICK_PERIOD_MS);  // let sensor stabilize in flowing water
+
+    float localTDS = NAN;
+    float localPH = NAN;
+
+    // --- Retry TDS ---
+    for (int i = 0; i < 3; i++) {
+        readTDSSensor(25.0);
+        LOG_DEBUG("TDS attempt %d → Raw: %.2f", i + 1, tdsValue);
+        if (tdsValue >= 0 && tdsValue <= 2000) {
+            localTDS = tdsValue;
+            break;
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
     }
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
 
-  // --- Always save result (valid or NAN) ---
-  saveCounter("tdsValue", isnan(tdsReading) ? NAN : tdsReading);
-  saveCounter("phValue",  isnan(phReading)  ? NAN : phReading);
+    // --- Stabilized pH Reading ---
+    localPH = stableReadPH();
 
-  if (isnan(tdsReading)) LOG_WARN("TDS invalid after retries → stored NULL");
-  if (isnan(phReading))  LOG_WARN("pH invalid after retries → stored NULL");
+    // --- Update globals only if valid ---
+    if (!isnan(localTDS)) {
+        tdsValue = localTDS;
+        saveCounter("tdsValue", tdsValue);
+        LOG_INFO("💧 Valid TDS = %.2f ppm", tdsValue);
+    } else {
+        saveCounter("tdsValue", NAN);
+        LOG_WARN("❌ TDS invalid after retries → stored NULL");
+    }
 
-  LOG_INFO("pH/TDS task finished → deleting itself");
-  vTaskDelete(NULL);
+    if (!isnan(localPH)) {
+        phValue = localPH;
+        saveCounter("phValue", phValue);
+        LOG_INFO("🧪 Valid pH = %.2f", phValue);
+    } else {
+        saveCounter("phValue", NAN);
+        LOG_WARN("❌ pH invalid after stabilization → stored NULL");
+    }
+
+    LOG_INFO("✅ pH/TDS Task finished → deleting itself");
+    vTaskDelete(NULL);
 }
 
 
+// ------------------- STABLE pH READING LOGIC -------------------
+float stableReadPH() {
+    LOG_INFO("🔬 Starting stabilized pH reading...");
+
+    float lastPH = 0.0, currentPH = 0.0;
+    int stableCount = 0;
+    int maxAttempts = 15;  // max ~15 seconds
+    int attempt = 0;
+
+    while (attempt < maxAttempts && stableCount < 3) {
+        readPHSensor();
+        currentPH = phValue;
+
+        LOG_DEBUG("pH[%d] = %.2f", attempt + 1, currentPH);
+
+        if (attempt > 0 && fabs(currentPH - lastPH) < 0.05) {
+            stableCount++;
+        } else {
+            stableCount = 0;  // reset if unstable
+        }
+
+        lastPH = currentPH;
+        attempt++;
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    if (stableCount >= 3 && currentPH > 0 && currentPH <= 14) {
+        LOG_INFO("✅ pH stabilized at %.2f after %d samples", currentPH, attempt);
+        return currentPH;
+    } else {
+        LOG_WARN("❌ pH failed to stabilize within %d attempts", attempt);
+        return NAN;
+    }
+}
 
 
 void flowSensorTask(void* pvParameters) {
@@ -467,58 +521,51 @@ void flowSensorTask(void* pvParameters) {
 
     if (flowRate > 0) {
       lastFlowTime = millis();
-    if (!flowFlag) {
-  flowFlag = true;
-  digitalWrite(RELAY2_PIN, HIGH);
-  flowStartTime = millis();
 
-  LOG_INFO("Water flow started, Relay 2 ON");
+      if (!flowFlag) {
+        flowFlag = true;
+        digitalWrite(RELAY2_PIN, HIGH);
+        flowStartTime = millis();
+        LOG_INFO("💧 Water flow started, Relay 2 ON");
 
-  // Spawn nested task (one-shot)
-  xTaskCreatePinnedToCore(
-    phTdsTask,
-    "phTdsTask",
-    4096,   // stack size
-    NULL,
-    1,
-    &phTaskHandle,
-    1
-  );
-  }
-
+        // Start pH/TDS read task
+        xTaskCreatePinnedToCore(
+          phTdsTask,
+          "phTdsTask",
+          4096,
+          NULL,
+          1,
+          &phTaskHandle,
+          1
+        );
+      }
     } 
     else if (flowFlag && (millis() - lastFlowTime >= flowStopDelay)) {
       flowFlag = false;
       digitalWrite(RELAY2_PIN, LOW);
 
-      // Calculate flow duration in minutes
       unsigned long flowDurationMs = millis() - flowStartTime;
       unsigned long flowDurationMinutes = flowDurationMs / 60000;
+      motorMinutes += flowDurationMinutes;
 
-      motorMinutes += flowDurationMinutes;  
-
-      // ✅ Save counters
       saveCounter("totalLiters", totalLiters);
       saveCounterULong("motorMinutes", motorMinutes);
 
-      LOG_INFO("Water flow stopped, Relay 2 OFF");
-      LOG_INFO("Total liters saved: %.2f", totalLiters);
-      LOG_INFO("Flow duration: %lu minutes", flowDurationMinutes);
-      LOG_INFO("Cumulative motor minutes: %lu", motorMinutes);
+      LOG_INFO("💧 Water flow stopped, Relay 2 OFF");
+      LOG_INFO("📊 Total liters saved: %.2f | Flow duration: %lu min | Cumulative motor minutes: %lu",
+                totalLiters, flowDurationMinutes, motorMinutes);
     }
-    LOG_DEBUG("Pulse count: %lu → FlowRate: %.2f L/min, Added: %.3f L, Total: %.2f L",
-              currentPulseCount, flowRate, totalLiters1/10, totalLiters);
 
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
+
 
 void checkRelayTask(void* pvParameters) {
   static int lastRelayState = digitalRead(RELAY1_PIN);
   static unsigned long lastMinuteCheck = 0;
   LOG_INFO("Check Relay Task started");
 
-  // Restore counters on boot
   compressorMinutes = readCounterULong("compMinutes", 0);
 
   if (lastRelayState == LOW) {
@@ -528,47 +575,62 @@ void checkRelayTask(void* pvParameters) {
 
   while (true) {
     measureUltrasonicDistance();
-    getLatestAverages(temperature, humidity, AQI, TVOC, ECO2);
+    getLatestReadings(temperature, humidity, AQI, TVOC, ECO2);
 
-    // --- Validate base sensor ranges first ---
+    // --- Validate sensor ranges ---
     bool tempValid = (!isnan(temperature) && temperature >= -40 && temperature <= 125 && temperature != 0.0);
-    bool humValid  = (!isnan(humidity)    && humidity >= 0   && humidity <= 100);
+    bool humValid  = (!isnan(humidity)    && humidity >= 1   && humidity <= 100);
+    bool distValid = (distance > 0 && distance < 500);
 
     bool tempOk = tempValid &&
                   (temperature >= config.tempThresholdMin && temperature <= config.tempThresholdMax);
-
     bool humOk  = humValid &&
                   (humidity   >= config.humidityThresholdMin && humidity   <= config.humidityThresholdMax);
 
-    // --- OFF conditions ---
-    if (distance <= config.compressorOffLevel || !tempOk || !humOk) {
+    // --- OFF conditions (tank full → always allowed) ---
+    if (distance <= config.compressorOffLevel) {
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
         compStartTime = 0;
-
-        LOG_WARN("Relay OFF → Compressor stopped (Reason: %s)",
-                 distance <= 6 ? "Tank full" :
-                 (!tempValid || !humValid ? "Invalid sensor data" : "Threshold exceeded"));
+        LOG_WARN("Relay OFF → Compressor stopped (Reason: Tank full)");
       }
     }
-    // --- ON conditions ---
-    else if (distance >= config.compressorOnLevel && tempOk && humOk) {
-      if (lastRelayState != LOW) {
-        if (millis() - lastRelayOffTime >= 180000) {  // 3-minute cooldown
-          digitalWrite(RELAY1_PIN, LOW);
-          lastRelayState = LOW;
-          compStartTime = millis();
-          lastMinuteCheck = compStartTime;
-          LOG_INFO("Relay ON → Compressor started");
-        } else {
-          LOG_DEBUG("Relay ON blocked (waiting 3 min since OFF)");
+
+    // --- ON / OFF control (only when valid sensors) ---
+    else if (tempValid && humValid && distValid) {
+      // --- OFF for bad environmental conditions ---
+      if (!tempOk || !humOk) {
+        if (lastRelayState != HIGH) {
+          digitalWrite(RELAY1_PIN, HIGH);
+          lastRelayState = HIGH;
+          lastRelayOffTime = millis();
+          compStartTime = 0;
+          LOG_WARN("Relay OFF → Compressor stopped (Reason: Env out of range)");
         }
       }
+      // --- ON when all ok ---
+      else if (distance >= config.compressorOnLevel && tempOk && humOk) {
+        if (lastRelayState != LOW) {
+          if (millis() - lastRelayOffTime >= 180000) {
+            digitalWrite(RELAY1_PIN, LOW);
+            lastRelayState = LOW;
+            compStartTime = millis();
+            lastMinuteCheck = compStartTime;
+            LOG_INFO("Relay ON → Compressor started");
+          } else {
+            LOG_DEBUG("Relay ON blocked (waiting 3 min since OFF)");
+          }
+        }
+      }
+    } else {
+      // --- Invalid sensor → do not turn ON, but allow OFF already handled above ---
+      LOG_WARN("Sensor invalid, holding current state (T=%.2f, H=%.2f, D=%d)",
+               temperature, humidity, distance);
     }
 
-    // --- Per-minute accumulation ---
+    // --- Per-minute runtime tracking ---
     if (lastRelayState == LOW && (millis() - lastMinuteCheck >= 60000)) {
       compressorMinutes++;
       saveCounterULong("compMinutes", compressorMinutes);
@@ -576,14 +638,12 @@ void checkRelayTask(void* pvParameters) {
       LOG_DEBUG("Compressor runtime incremented: %lu minutes", compressorMinutes);
     }
 
-    LOG_DEBUG("CheckRelay loop → Temp: %.2f (%.2f-%.2f) | Hum: %.2f (%.2f-%.2f) | Distance: %d",
-              temperature, config.tempThresholdMin, config.tempThresholdMax,
-              humidity, config.humidityThresholdMin, config.humidityThresholdMax,
-              distance);
-
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
+
+
+
 
 void saveCounter(const char* key, float value) {
   if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
@@ -624,77 +684,139 @@ unsigned long readCounterULong(const char* key, unsigned long defaultValue = 0) 
   }
   return value;
 }
-
-void sensorAvgTask(void *pvParameters) {
-  while (1) {
-    float temperature = NAN, humidity = NAN;
-    uint8_t aqi = 0;
-    uint16_t tvoc = 0, eco2 = 0;
-
-    // --- Read SHT sensor ---
-    if (sht.readSample()) {
-      temperature = sht.getTemperature();
-      humidity    = sht.getHumidity();
-    }
-
-    // --- Read ENS160 sensor ---
-    int status = ens160.getENS160Status();
-    if (status == 1) {
-      aqi  = ens160.getAQI();
-      tvoc = ens160.getTVOC();
-      eco2 = ens160.getECO2();
-    }
-
-    // --- Update accumulators safely ---
-    if (xSemaphoreTake(sensorMutex, portMAX_DELAY) == pdTRUE) {
-      avgTemp += isnan(temperature) ? 0 : temperature;
-      avgHum  += isnan(humidity) ? 0 : humidity;
-      avgAQI  += aqi;
-      avgTVOC += tvoc;
-      avgECO2 += eco2;
-      sampleCount++;
-
-      // ✅ After 1 sample (since we read once per minute)
-      bufferReady.temp = avgTemp / sampleCount;
-      bufferReady.hum  = avgHum  / sampleCount;
-      bufferReady.AQI  = avgAQI  / sampleCount;
-      bufferReady.TVOC = avgTVOC / sampleCount;
-      bufferReady.ECO2 = avgECO2 / sampleCount;
-      bufferReady.count = sampleCount;
-
-      bufferSwap = true;  // mark new averages ready
-
-      // Reset accumulators for next minute
-      avgTemp = avgHum = avgAQI = avgTVOC = avgECO2 = 0;
-      sampleCount = 0;
-
-      xSemaphoreGive(sensorMutex);
-    }
-  LOG_DEBUG("SHT → Temp: %.2f, Hum: %.2f | ENS160 → AQI: %d, TVOC: %u, eCO2: %u",
-          temperature, humidity, aqi, tvoc, eco2);
-
-    // ✅ Delay exactly 1 minute
-    vTaskDelay(60000 / portTICK_PERIOD_MS);
-  }
-}
-
-// -------------------- Get Latest Averages --------------------
-bool getLatestAverages(float &temperature, float &humidity,
+bool getLatestReadings(float &temperature, float &humidity,
                        uint8_t &aqi, uint16_t &tvoc, uint16_t &eco2) {
-  if (bufferSwap && bufferReady.count > 0) {
-    if (xSemaphoreTake(sensorMutex, portMAX_DELAY) == pdTRUE) {
-      temperature = bufferReady.temp;
-      humidity    = bufferReady.hum;
-      aqi         = bufferReady.AQI;
-      tvoc        = bufferReady.TVOC;
-      eco2        = bufferReady.ECO2;
-      bufferSwap  = false;  // consume data
-      xSemaphoreGive(sensorMutex);
+
+  // --- Check SHT20 initialization ---
+  if (!shtInitialized) {
+    LOG_WARN("SHT20 not initialized. Attempting reinitialization...");
+    shtInitialized = sht.init();
+    if (shtInitialized) {
+      LOG_INFO("SHT20 reinitialized successfully.");
+      sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
+    } else {
+      LOG_ERROR("SHT20 reinitialization failed.");
     }
-    return true;
   }
-  return false;
+
+  // --- Read SHT20 sensor ---
+  if (shtInitialized && sht.readSample()) {
+    temperature = sht.getTemperature();
+    humidity    = sht.getHumidity();
+  } else {
+    temperature = humidity = NAN;
+    LOG_WARN("Failed to read from SHT20 sensor.");
+  }
+
+  // --- Check ENS160 initialization ---
+  if (!ensInitialized) {
+    LOG_WARN("ENS160 not initialized. Attempting reinitialization...");
+    if (NO_ERR == ens160.begin()) {
+      LOG_INFO("ENS160 reinitialized successfully!");
+      ens160.setPWRMode(ENS160_STANDARD_MODE);
+      ens160.setTempAndHum(25.0, 50.0);  // Initial default
+      ensInitialized = true;
+      delay(2000);
+    } else {
+      LOG_ERROR("ENS160 reinitialization failed.");
+      ensInitialized = false;
+    }
+  }
+
+  // --- Send T/H to ENS160 ---
+  if (ensInitialized) {
+    if (!isnan(temperature) && !isnan(humidity)) {
+      ens160.setTempAndHum(temperature, humidity);
+      LOG_INFO("Sent T=%.2f°C, H=%.2f%% to ENS160", temperature, humidity);
+    } else {
+      ens160.setTempAndHum(25.0, 50.0);
+      LOG_WARN("Using default T/H values for ENS160 compensation");
+    }
+  }
+
+  // --- Read ENS160 data ---
+  static uint8_t lastAQI = 1;
+  static uint16_t lastTVOC = 0, lastECO2 = 400;
+
+  uint8_t localAQI = lastAQI;
+  uint16_t localTVOC = lastTVOC, localECO2 = lastECO2;
+
+  if (ensInitialized) {
+    readENS160Sensor(localAQI, localTVOC, localECO2);
+    lastAQI = localAQI;
+    lastTVOC = localTVOC;
+    lastECO2 = localECO2;
+  }
+
+  aqi  = localAQI;
+  tvoc = localTVOC;
+  eco2 = localECO2;
+
+  return (shtInitialized && ensInitialized);
 }
+
+
+// --- ENS160 robust read function ---
+void readENS160Sensor(uint8_t &outAQI, uint16_t &outTVOC, uint16_t &outECO2) {
+  static unsigned long lastRetry = 0;
+  int status = ens160.getENS160Status();
+  LOG_INFO("ENS160 Status: %d", status);
+
+  switch (status) {
+    case 1: // Valid data
+      isENS = true;
+      outAQI  = ens160.getAQI();
+      outTVOC = ens160.getTVOC();
+      outECO2 = ens160.getECO2();
+      LOG_INFO("ENS160 Data OK → AQI: %d, TVOC: %d ppb, eCO2: %d ppm",
+               outAQI, outTVOC, outECO2);
+      break;
+
+    case 2: // Warm-up
+      isENS = true; // Sensor is running, data may still be good
+      outAQI  = ens160.getAQI();
+      outTVOC = ens160.getTVOC();
+      outECO2 = ens160.getECO2();
+      LOG_INFO("ENS160 warming up → AQI: %d, TVOC: %d, eCO2: %d",
+               outAQI, outTVOC, outECO2);
+      break;
+
+    case 0: // Not initialized
+    case 3: // Invalid data
+    default:
+      isENS = false;
+      if (millis() - lastRetry > 5000) {
+        LOG_WARN("ENS160 invalid/uninitialized. Attempting reinit...");
+        ens160.begin();
+        ens160.setPWRMode(ENS160_STANDARD_MODE);
+        ens160.setTempAndHum(25.0, 50.0);
+        lastRetry = millis();
+        LOG_INFO("ENS160 reinitialized.");
+      }
+      break;
+  }
+}
+
+
+
+
+// // -------------------- Get Latest Averages --------------------
+// bool getLatestReadings(float &temperature, float &humidity,
+//                        uint8_t &aqi, uint16_t &tvoc, uint16_t &eco2) {
+//   if (bufferSwap && bufferReady.count > 0) {
+//     if (xSemaphoreTake(sensorMutex, portMAX_DELAY) == pdTRUE) {
+//       temperature = bufferReady.temp;
+//       humidity    = bufferReady.hum;
+//       aqi         = bufferReady.AQI;
+//       tvoc        = bufferReady.TVOC;
+//       eco2        = bufferReady.ECO2;
+//       bufferSwap  = false;  // consume data
+//       xSemaphoreGive(sensorMutex);
+//     }
+//     return true;
+//   }
+//   return false;
+// }
 
 bool hasInternetConnection() {
   WiFiClient client;
@@ -1254,21 +1376,8 @@ void sendViaGSM() {
   doc["DeviceFirmwareVersion"] = current_firmware_version;
 
   // Pull the latest averages
-  if (!getLatestAverages(temperature, humidity, AQI, TVOC, ECO2)) {
-    LOG_WARN("No averages ready yet.");
-    // --- Read SHT sensor ---
-    if (sht.readSample()) {
-      temperature = sht.getTemperature();
-      humidity    = sht.getHumidity();
-    }
+  if (!getLatestReadings(temperature, humidity, AQI, TVOC, ECO2)) {
 
-    // --- Read ENS160 sensor ---
-    int status = ens160.getENS160Status();
-    if (status == 1) {
-      AQI  = ens160.getAQI();
-      TVOC = ens160.getTVOC();
-      ECO2 = ens160.getECO2();
-    }
 
   }
 
@@ -1341,15 +1450,15 @@ void sendViaGSM() {
   if (success) {
     LOG_INFO("MQTT Publish Success: %s", jsonBuffer.c_str());
 
-    digitalWrite(dataStatus, HIGH);
-    delay(2000);
-    digitalWrite(dataStatus, LOW);
+
     mqttFailureCount = 0;
 
     // ✅ Reset counters with generic save functions
     saveCounter("totalLiters", 0.0f);
     saveCounterULong("motorMinutes", 0);
     saveCounterULong("compMinutes", 0);
+    motorMinutes = 0;
+compressorMinutes = 0;
 
   } else {
     LOG_ERROR("All MQTT publish attempts failed.");
@@ -1525,26 +1634,10 @@ void sendViaWIFI() {
     }
 
    // Pull the latest averages
-if (!getLatestAverages(temperature, humidity, AQI, TVOC, ECO2)) {
+  if (!getLatestReadings(temperature, humidity, AQI, TVOC, ECO2)) {
   LOG_WARN("No averages ready yet.");
 
-  // --- Read SHT sensor ---
-  if (sht.readSample()) {
-    temperature = sht.getTemperature();
-    humidity    = sht.getHumidity();
-    LOG_INFO("SHT sensor read success → Temp: %.2f °C, Humidity: %.2f %%", temperature, humidity);
-  } else {
-    LOG_ERROR("Failed to read SHT sensor.");
   }
-
-  // --- Read ENS160 sensor ---
-
-    AQI  = ens160.getAQI();
-    TVOC = ens160.getTVOC();
-    ECO2 = ens160.getECO2();
-    LOG_INFO("ENS160 read success → AQI: %d, TVOC: %d ppb, ECO2: %d ppm", AQI, TVOC, ECO2);
- 
-}
 
 
     DynamicJsonDocument doc(1024);
@@ -1576,7 +1669,7 @@ if (!getLatestAverages(temperature, humidity, AQI, TVOC, ECO2)) {
     if (AQI < 1 || AQI > 5) doc["AQI"] = nullptr;
     else doc["AQI"] = AQI;
 
-    if (TVOC < 1 || TVOC > 65000) doc["TVOC"] = nullptr;
+    if (TVOC < 0 || TVOC > 65000) doc["TVOC"] = nullptr;
     else doc["TVOC"] = TVOC;
 
     if (ECO2 < 400 || ECO2 > 65000) doc["ECO2"] = nullptr;
@@ -1629,7 +1722,8 @@ if (!getLatestAverages(temperature, humidity, AQI, TVOC, ECO2)) {
       saveCounter("totalLiters", 0.0f);
       saveCounterULong("motorMinutes", 0);
       saveCounterULong("compMinutes", 0);
-      
+      motorMinutes = 0;
+      compressorMinutes = 0;
       digitalWrite(dataStatus, HIGH);
       delay(2000);
       digitalWrite(dataStatus, LOW);
@@ -1658,16 +1752,19 @@ bool isButtonPressed() {
   return false;
 }
 
-float medianOfArray(int arr[], int n) {
-  for (int i = 0; i < n - 1; ++i) {
-    int minidx = i;
-    for (int j = i + 1; j < n; ++j)
-      if (arr[j] < arr[minidx]) minidx = j;
-    int t = arr[i];
-    arr[i] = arr[minidx];
-    arr[minidx] = t;
-  }
-  return arr[n / 2];
+int medianOfArray(int arr[], int n) {
+    int temp[n];
+    memcpy(temp, arr, n * sizeof(int));
+    for (int i = 0; i < n - 1; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            if (temp[i] > temp[j]) {
+                int t = temp[i];
+                temp[i] = temp[j];
+                temp[j] = t;
+            }
+        }
+    }
+    return temp[n / 2];  // Return median value
 }
 // ------------------- TDS Sensor -------------------
 void readTDSSensor(float temperature) {
@@ -1691,42 +1788,50 @@ void readTDSSensor(float temperature) {
 }
 
 
+
+// ------------------- pH SENSOR READ FUNCTION -------------------
 void readPHSensor() {
+    int rawSamples[SAMPLES];
 
-
-  int rawSamples[SAMPLES];
-  for (int i = 0; i < SAMPLES; ++i) {
-    rawSamples[i] = analogRead(PH_PIN);
-    delay(SAMPLE_DELAY_MS);
-  }
-
-  int med = medianOfArray(rawSamples, SAMPLES);
-
-  long sum = 0;
-  int count = 0;
-  for (int i = 0; i < SAMPLES; ++i) {
-    if (abs(rawSamples[i] - med) <= 37) {  // ±37 counts ≈ ±30 mV
-      sum += rawSamples[i];
-      ++count;
+    // Collect multiple samples
+    for (int i = 0; i < SAMPLES; ++i) {
+        rawSamples[i] = analogRead(PH_PIN);
+        delay(SAMPLE_DELAY_MS);
     }
-  }
-  float avgADC = (count > 0) ? (float)sum / count : (float)med;
 
-  float avgV = avgADC * 3.3 / 4095.0;  // Convert to volts
-  float mv = avgV * 1000.0;            // mV
-  float rel_mV = (avgADC - neutralADC) * (3.3 / 4095.0) * 1000.0;
+    // Find median
+    int med = medianOfArray(rawSamples, SAMPLES);
 
-  float s25 = slope25();
-  float sT = s25 * ((temperatureC + 273.15) / (25.0 + 273.15));
-  phValue = sT * (avgADC - neutralADC) + 7.0;
-  // ✅ Force to 0 if out of valid pH range
-  if (phValue < 0.0 || phValue > 14.0) {
-    phValue = 0.0;
-  }
-  Serial.print("PH Value");
+    // Remove outliers (±37 counts ≈ ±30 mV)
+    long sum = 0;
+    int count = 0;
+    for (int i = 0; i < SAMPLES; ++i) {
+        if (abs(rawSamples[i] - med) <= 37) {
+            sum += rawSamples[i];
+            ++count;
+        }
+    }
 
-  Serial.println(phValue);
+    float avgADC = (count > 0) ? (float)sum / count : (float)med;
+
+    // Convert ADC to voltage
+    float avgV = avgADC * 3.3 / 4095.0;
+    float mv = avgV * 1000.0;
+    float rel_mV = (avgADC - neutralADC) * (3.3 / 4095.0) * 1000.0;
+
+    // Apply temperature-compensated slope
+    float s25 = slope25();
+    float sT = s25 * ((temperatureC + 273.15) / (25.0 + 273.15));
+    phValue = sT * (avgADC - neutralADC) + 7.0;
+
+    // Force invalid readings to 0.0
+    if (phValue < 0.0 || phValue > 14.0) {
+        phValue = 0.0;
+    }
+
+    LOG_DEBUG("Raw ADC: %.2f → pH: %.2f", avgADC, phValue);
 }
+
 
 void measureUltrasonicDistance() {
   sensorSerial.write(0x55);
