@@ -941,6 +941,14 @@ String generateMainPage() {
   html += "<td><input type='number' step='0.1' name='compressorOffLevel' value='" + String(config.compressorOffLevel, 1) + "' style='width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px;'></td>";
   html += "<td>cm</td>";
   html += "</tr>";
+  
+  html += "<tr>";
+  html += "<td>Pump Off Level</td>";
+  html += "<td>" + String(config.pumpOffLevel, 1) + "</td>";
+  html += "<td><input type='number' step='0.1' name='pumpOffLevel' value='" + String(config.pumpOffLevel, 1) + "' style='width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px;'></td>";
+  html += "<td>cm</td>";
+  html += "</tr>";
+  
   html += "<tr>";
   html += "<td>Publish Interval</td>";
   html += "<td>" + String(config.publishInterval / 60000) + "</td>";
