@@ -21,6 +21,8 @@
 #include <Preferences.h>
 #define MIN_VALID_PULSES 3
 
+#define TDS_CAL_ULTRA_LOW  2.54f   // <20 ppm correction
+#define ULTRASONIC_FAIL_THRESHOLD 5
 // PH
 // ==== USER CALIBRATION VALUES FROM YOUR SENSOR ====
 float intercept = 17.5053;  // from your extracted values
@@ -232,7 +234,7 @@ uint8_t AQI = 0;
 uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "3.0.0";
+const char* current_firmware_version = "2.0.8";
 ///======== FORWARD DECLARATIONS SECTION =======//
 // Forward declarations for functions to ensure compilation order
 float readCounter(const char* key, float defaultValue);
@@ -532,9 +534,17 @@ void readTDSSensor(float temperature) {
     TDS_SLEW_RATE);
 
   // ---- APPLY RANGE-WISE CALIBRATION ----
-  int range = detectTDSRange(smoothRaw);
-  float calibratedTDS = smoothRaw * TDS_CAL_RANGE[range];
 
+  // ---- APPLY RANGE-WISE CALIBRATION ----
+  float calibratedTDS;
+
+  int range;
+  if (smoothRaw < 20.0f) {
+    calibratedTDS = smoothRaw * TDS_CAL_ULTRA_LOW;
+  } else {
+     range = detectTDSRange(smoothRaw);
+    calibratedTDS = smoothRaw * TDS_CAL_RANGE[range];
+  }
   // Final sanity check
   if (calibratedTDS >= 0 && calibratedTDS <= 2000) {
     tdsValue = calibratedTDS;
@@ -1469,7 +1479,7 @@ void sendViaGSM() {
 
   /* ================= MQTT CONNECTION CHECK ================= */
   if (!checkMQTTConnection()) {
-    LOG_ERROR("MQTT not connected, resetting GSM MQTT stack");
+    LOG_ERROR("MQTT reconnection needed");
 
     sendATCommandGetResponse("AT+CMQTTDISC=0,120", 5000);
     sendATCommandGetResponse("AT+CMQTTREL=0", 5000);
@@ -1479,7 +1489,7 @@ void sendViaGSM() {
     isMQTTConnected = false;
 
     if (!connectMQTT()) {
-      LOG_ERROR("GSM MQTT reconnect failed");
+      LOG_ERROR("Failed to reconnect MQTT. Will retry later.");
       mqttFailureCount++;
       return;
     }
@@ -1488,26 +1498,25 @@ void sendViaGSM() {
   /* ================= TIMESTAMP ================= */
   unsigned long timestamp = getUnixTimestamp();
   if (timestamp == 0) {
-    LOG_ERROR("Unix time failed, using millis()");
+    LOG_ERROR("Failed to get Unix timestamp, using millis()");
     timestamp = millis() / 1000;
   }
-
-  /* ================= SAFE DISTANCE READ ================= */
+ /* ================= SAFE DISTANCE READ ================= */
   float distanceToSend = NAN;
   if (xSemaphoreTake(ultrasonicMutex, portMAX_DELAY)) {
     distanceToSend = distance;
     xSemaphoreGive(ultrasonicMutex);
   }
-
   /* ================= JSON BUILD ================= */
-  DynamicJsonDocument doc(1536);   // increased for safety
+ 
+  StaticJsonDocument<1536> doc;
 
   doc["TimeStamp"] = timestamp;
   doc["DeviceId"] = config.deviceId;
   doc["DeviceName"] = "AeroneroControlSystem";
   doc["DeviceFirmwareVersion"] = current_firmware_version;
 
-  /* ================= SENSOR VALUES ================= */
+  /* ================= SENSOR VALUES (2 DECIMALS ONLY IN JSON) ================= */
 
   jsonFloat2(doc, "Temperature",
              (isnan(temperature) || temperature < -40 || temperature > 125 || temperature == 0.0)
@@ -1520,87 +1529,98 @@ void sendViaGSM() {
                : humidity);
 
   jsonFloat2(doc, "WaterTankLevel",
-             (isnan(distanceToSend) || distanceToSend < 3 || distanceToSend > 500)
+             (distanceToSend < 3 || distanceToSend > 500)
                ? NAN
                : distanceToSend);
 
-  float savedPh  = readCounter("phValue", NAN);
+  float savedPh = readCounter("phValue", NAN);
   float savedTds = readCounter("tdsValue", NAN);
 
   jsonFloat2(doc, "PhValue",
-             (savedPh < 1 || savedPh > 14) ? NAN : savedPh);
+             (savedPh < 1 || savedPh > 14)
+               ? NAN
+               : savedPh);
 
   jsonFloat2(doc, "Tds",
-             (savedTds < 1 || savedTds > 1000) ? NAN : savedTds);
+             (savedTds < 1 || savedTds > 1000)
+               ? NAN
+               : savedTds);
 
-  /* ================= AIR QUALITY ================= */
-/* ================= AIR QUALITY ================= */
+  /* ================= AIR QUALITY (INTEGERS) ================= */
+  /* ================= AIR QUALITY (INTEGERS) ================= */
 
-if (AQI < 1 || AQI > 5) {
-  doc["AQI"] = nullptr;
-} else {
-  doc["AQI"] = AQI;
-}
+  if (AQI < 1 || AQI > 5) {
+    doc["AQI"] = nullptr;
+  } else {
+    doc["AQI"] = AQI;
+  }
 
-if (TVOC < 0 || TVOC > 65000) {
-  doc["TVOC"] = nullptr;
-} else {
-  doc["TVOC"] = TVOC;
-}
+  if (TVOC < 0 || TVOC > 65000) {
+    doc["TVOC"] = nullptr;
+  } else {
+    doc["TVOC"] = TVOC;
+  }
 
-if (ECO2 < 400 || ECO2 > 65000) {
-  doc["ECO2"] = nullptr;
-} else {
-  doc["ECO2"] = ECO2;
-}
-
+  if (ECO2 < 400 || ECO2 > 65000) {
+    doc["ECO2"] = nullptr;
+  } else {
+    doc["ECO2"] = ECO2;
+  }
 
   /* ================= COUNTERS ================= */
 
-  float savedLiters          = readCounter("totalLiters", 0.0f);
-  unsigned long motor        = readCounterULong("motorMinutes", 0);
-  unsigned long compressor   = readCounterULong("compMinutes", 0);
+  float savedLiters = readCounter("totalLiters", 0.0f);
+  unsigned long motor = readCounterULong("motorMinutes", 0);
+  unsigned long compressor = readCounterULong("compMinutes", 0);
 
-  float litersToSend = (!flowFlag) ? savedLiters : 0.0f;
-  if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
+  float litersToSend = 0.0f;
+
+  if (!flowFlag) {
+    litersToSend = savedLiters;
+    if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
+  } else {
+    litersToSend = 0.0f;
+    motor = 0;
+  }
 
   jsonFloat2(doc, "WaterTotalizer", litersToSend);
+
   doc["Motor"] = motor;
   doc["Compressor"] = compressor;
 
   /* ================= METADATA ================= */
 
   doc["DataCollectionInterval"] = config.publishInterval / 60000;
-  doc["Timezone"] = "UTC+05:30";          // FIXED
+  doc["Timezone"] = "IST-05:30";
   doc["TimezoneCountry"] = "Asia/Kolkata";
   doc["TimeAutoSync"] = "Enabled";
   doc["MQTTEndpoint"] = "a1brrleef337f0-ats.iot.ap-south-1.amazonaws.com";
-  doc["MQTTPort"] = 8883;
+  doc["MQTTPort"] = "8883";
   doc["AirQualityRegulationRegion"] = "India";
 
-  /* ================= SERIALIZE (NO STRING HEAP FRAG) ================= */
-
+  /* ================= SERIALIZE ================= */
   char jsonBuffer[1536];
-  size_t len = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
 
-  if (len == 0) {
-    LOG_ERROR("JSON serialization failed");
-    return;
-  }
+  size_t len = serializeJson(
+    doc,
+    jsonBuffer,
+    sizeof(jsonBuffer)
+  );
+
 
   /* ================= MQTT PUBLISH WITH RETRY ================= */
-
   bool success = false;
+  int retryDelay = 100;
 
   for (int i = 0; i < 3; i++) {
-
     if (publishMQTTMessage(jsonBuffer)) {
       success = true;
       break;
     }
 
-    LOG_ERROR("GSM MQTT publish failed (Attempt %d)", i + 1);
-    delay(100 << i);   // 100, 200, 400 ms
+    LOG_ERROR("MQTT Publish failed (Attempt %d/3)", i + 1);
+    delay(retryDelay);
+    retryDelay *= 2;
 
     if (!checkMQTTConnection()) {
       connectMQTT();
@@ -1608,37 +1628,45 @@ if (ECO2 < 400 || ECO2 > 65000) {
   }
 
   /* ================= POST-PUBLISH HANDLING ================= */
+  if (success) {
 
-  if (!success) {
-    LOG_ERROR("All GSM MQTT publish attempts failed");
-    mqttFailureCount++;
-    return;
-  }
+    if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
 
-  mqttFailureCount = 0;
+      if (!flowFlag) {
+        totalLiters = 0.0f;
+        prefs.begin("counters", false);
+        prefs.putFloat("totalLiters", 0.0f);
+        prefs.end();
+      }
 
-  if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
+      motorMinutes = 0;
+      compressorMinutes = 0;
 
-    if (!flowFlag) {
       prefs.begin("counters", false);
-      prefs.putFloat("totalLiters", 0.0f);
+      prefs.putULong("motorMinutes", 0);
+      prefs.putULong("compMinutes", 0);
       prefs.end();
+
+      xSemaphoreGive(prefsMutex);
+    } else {
+      LOG_ERROR("Failed to take prefsMutex to reset counters");
     }
 
-    prefs.begin("counters", false);
-    prefs.putULong("motorMinutes", 0);
-    prefs.putULong("compMinutes", 0);
-    prefs.end();
+    digitalWrite(dataStatus, HIGH);
+    delay(2000);
+    digitalWrite(dataStatus, LOW);
 
-    xSemaphoreGive(prefsMutex);
+    mqttFailureCount = 0;
+
+  } else {
+    LOG_ERROR("All MQTT publish attempts failed.");
+    mqttFailureCount++;
   }
-
-  digitalWrite(dataStatus, HIGH);
-  delay(1500);
-  digitalWrite(dataStatus, LOW);
 
   lastKeepAliveTime = millis();
 }
+
+
 
 // MQTT publish for GSM (optimized: step-by-step AT commands)
 bool publishMQTTMessage(String message) {
@@ -1766,10 +1794,12 @@ bool connectWiFi() {
 }
 ///======== WIFI PUBLISH SECTION =======//
 // Send data via WiFi (similar to GSM, optimized: shared validation logic)
+
+// Send data via WiFi (similar to GSM, optimized: shared validation logic)
 void sendViaWIFI() {
 
   if (WiFi.status() != WL_CONNECTED) {
-    LOG_ERROR("WiFi not connected. Reconnection handled elsewhere.");
+    LOG_ERROR("WiFi not connected. Reconnection handled by checkConnectivityTask.");
     return;
   }
 
@@ -1779,11 +1809,12 @@ void sendViaWIFI() {
   if (getLocalTime(&timeinfo)) {
     timestamp = mktime(&timeinfo);
   } else {
-    LOG_ERROR("Time sync failed, using millis()");
+    LOG_ERROR("Failed to update time");
     timestamp = millis() / 1000;
   }
 
   if (timestamp == 0) {
+    LOG_ERROR("Invalid timestamp, using millis()");
     timestamp = millis() / 1000;
   }
 
@@ -1793,16 +1824,16 @@ void sendViaWIFI() {
     distanceToSend = distance;
     xSemaphoreGive(ultrasonicMutex);
   }
-
   /* ================= JSON BUILD ================= */
-  DynamicJsonDocument doc(1536);   // increased size
+  StaticJsonDocument<1024> doc;
+
 
   doc["TimeStamp"] = timestamp;
   doc["DeviceId"] = config.deviceId;
   doc["DeviceName"] = "AeroneroControlSystem";
   doc["DeviceFirmwareVersion"] = current_firmware_version;
 
-  /* ================= SENSOR VALUES ================= */
+  /* ================= SENSOR VALUES (2 DECIMALS ONLY IN JSON) ================= */
 
   jsonFloat2(doc, "Temperature",
              (isnan(temperature) || temperature < -40 || temperature > 125 || temperature == 0.0)
@@ -1815,125 +1846,144 @@ void sendViaWIFI() {
                : humidity);
 
   jsonFloat2(doc, "WaterTankLevel",
-             (isnan(distanceToSend) || distanceToSend < 3 || distanceToSend > 500)
+             (distanceToSend < 3 || distanceToSend > 500)
                ? NAN
                : distanceToSend);
 
-  float savedPh  = readCounter("phValue", NAN);
+  float savedPh = readCounter("phValue", NAN);
   float savedTds = readCounter("tdsValue", NAN);
 
   jsonFloat2(doc, "PhValue",
-             (savedPh < 1 || savedPh > 14) ? NAN : savedPh);
+             (savedPh < 1 || savedPh > 14)
+               ? NAN
+               : savedPh);
 
   jsonFloat2(doc, "Tds",
-             (savedTds < 1 || savedTds > 1000) ? NAN : savedTds);
+             (savedTds < 1 || savedTds > 1000)
+               ? NAN
+               : savedTds);
 
-  /* ================= AIR QUALITY ================= */
-/* ================= AIR QUALITY ================= */
+  /* ================= AIR QUALITY (INTEGERS) ================= */
+  /* ================= AIR QUALITY (INTEGERS) ================= */
 
-if (AQI < 1 || AQI > 5) {
-  doc["AQI"] = nullptr;
-} else {
-  doc["AQI"] = AQI;
-}
+  if (AQI < 1 || AQI > 5) {
+    doc["AQI"] = nullptr;
+  } else {
+    doc["AQI"] = AQI;
+  }
 
-if (TVOC < 0 || TVOC > 65000) {
-  doc["TVOC"] = nullptr;
-} else {
-  doc["TVOC"] = TVOC;
-}
+  if (TVOC < 0 || TVOC > 65000) {
+    doc["TVOC"] = nullptr;
+  } else {
+    doc["TVOC"] = TVOC;
+  }
 
-if (ECO2 < 400 || ECO2 > 65000) {
-  doc["ECO2"] = nullptr;
-} else {
-  doc["ECO2"] = ECO2;
-}
-
+  if (ECO2 < 400 || ECO2 > 65000) {
+    doc["ECO2"] = nullptr;
+  } else {
+    doc["ECO2"] = ECO2;
+  }
 
   /* ================= COUNTERS ================= */
 
-  float savedLiters      = readCounter("totalLiters", 0.0f);
-  unsigned long motor    = readCounterULong("motorMinutes", 0);
-  unsigned long comp     = readCounterULong("compMinutes", 0);
+  float savedLiters = readCounter("totalLiters", 0.0f);
+  unsigned long motor = readCounterULong("motorMinutes", 0);
+  unsigned long comp = readCounterULong("compMinutes", 0);
 
-  float litersToSend = (!flowFlag) ? savedLiters : 0.0f;
-  if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
+  float litersToSend = 0.0f;
+
+  if (!flowFlag) {
+    litersToSend = savedLiters;
+    if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
+  } else {
+    litersToSend = 0.0f;
+    motor = 0;
+  }
 
   jsonFloat2(doc, "WaterTotalizer", litersToSend);
-  doc["Motor"]      = motor;
+
+  doc["Motor"] = motor;
   doc["Compressor"] = comp;
 
   /* ================= METADATA ================= */
 
   doc["DataCollectionInterval"] = config.publishInterval / 60000;
-  doc["Timezone"] = "UTC+05:30";
+  doc["Timezone"] = "IST-05:30";
   doc["TimezoneCountry"] = "Asia/Kolkata";
   doc["TimeAutoSync"] = "Enabled";
   doc["MQTTEndpoint"] = "a1brrleef337f0-ats.iot.ap-south-1.amazonaws.com";
-  doc["MQTTPort"] = 8883;
+  doc["MQTTPort"] = "8883";
   doc["AirQualityRegulationRegion"] = "India";
 
   /* ================= SERIALIZE ================= */
 
-  char jsonBuffer[1536];
-  size_t len = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
-
-  if (len == 0) {
-    LOG_ERROR("JSON serialization failed");
-    return;
-  }
+  char jsonBuffer[1024];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
 
   /* ================= MQTT CONNECTION ================= */
 
   if (!client.connected()) {
+    LOG_ERROR("MQTT not connected, attempting reconnect...");
     connectAWS();
-    client.loop();
   }
 
-  /* ================= MQTT PUBLISH ================= */
+  /* ================= MQTT PUBLISH WITH RETRY ================= */
 
   bool success = false;
+  int retryDelay = 100;
 
   for (int i = 0; i < 3; i++) {
     if (client.publish(AWS_IOT_PUBLISH_TOPIC, jsonBuffer)) {
       success = true;
       break;
     }
-    delay(100 << i);
+
+    LOG_ERROR("MQTT Publish failed (Attempt %d/3). Error: %d",
+              i + 1, client.state());
+
+    delay(retryDelay);
+    retryDelay *= 2;
     connectAWS();
-    client.loop();
   }
 
-  /* ================= POST PUBLISH ================= */
+  /* ================= POST-PUBLISH HANDLING ================= */
 
-  if (!success) {
-    LOG_ERROR("MQTT publish failed");
-    mqttFailureCount++;
-    return;
-  }
+  if (success) {
 
-  mqttFailureCount = 0;
+    if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
 
-  if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
+      if (!flowFlag) {
+        totalLiters = 0.0f;
+        prefs.begin("counters", false);
+        prefs.putFloat("totalLiters", 0.0f);
+        prefs.end();
+      }
 
-    if (!flowFlag) {
+      motorMinutes = 0;
+      compressorMinutes = 0;
+
       prefs.begin("counters", false);
-      prefs.putFloat("totalLiters", 0.0f);
+      prefs.putULong("motorMinutes", 0);
+      prefs.putULong("compMinutes", 0);
       prefs.end();
+
+      xSemaphoreGive(prefsMutex);
+    } else {
+      LOG_ERROR("Failed to take prefsMutex to reset counters");
     }
 
-    prefs.begin("counters", false);
-    prefs.putULong("motorMinutes", 0);
-    prefs.putULong("compMinutes", 0);
-    prefs.end();
+    digitalWrite(dataStatus, HIGH);
+    delay(2000);
+    digitalWrite(dataStatus, LOW);
 
-    xSemaphoreGive(prefsMutex);
+    mqttFailureCount = 0;
+
+  } else {
+    LOG_ERROR("All MQTT publish attempts failed.");
+    mqttFailureCount++;
   }
-
-  digitalWrite(dataStatus, HIGH);
-  delay(1500);
-  digitalWrite(dataStatus, LOW);
 }
+
 
 ///======== BUTTON AND BUZZER SECTION =======//
 // Button press detection (optimized: debounced hold time)
@@ -1975,72 +2025,99 @@ float readUltrasonicRaw() {
   uint8_t buffer[4];
 
   // Flush junk
-  while (sensorSerial.available()) sensorSerial.read();
+  while (sensorSerial.available()) {
+    sensorSerial.read();
+  }
 
+  // Trigger measurement
   sensorSerial.write(0x55);
 
   unsigned long start = millis();
-  while (sensorSerial.available() < 4 && millis() - start < 150) {
-    delay(5);
+  while (sensorSerial.available() < 4) {
+    if (millis() - start > 250) {   // timeout
+      return NAN;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
-
-  if (sensorSerial.available() < 4) return NAN;
 
   for (int i = 0; i < 4; i++) {
     buffer[i] = sensorSerial.read();
   }
 
+  // Header check
   if (buffer[0] != 0xFF) return NAN;
 
+  // Checksum
   uint8_t checksum = (buffer[0] + buffer[1] + buffer[2]) & 0xFF;
   if (checksum != buffer[3]) return NAN;
 
   uint16_t distanceMM = (buffer[1] << 8) | buffer[2];
   float cm = distanceMM / 10.0f;
 
-  if (cm < 3 || cm > 500) return NAN;
+  if (cm < 3.0f || cm > 500.0f) return NAN;
 
   return cm;
 }
+void reinitUltrasonicUART() {
+  LOG_ERROR("Ultrasonic: UART reinitialization");
+
+  sensorSerial.end();
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  sensorSerial.setRxBufferSize(1024);
+  sensorSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
+}
+
 
 /// Safe wrapper for ultrasonic measurement
 //======== ULTRASONIC SAFE MEASUREMENT =======//
 void measureUltrasonicDistance() {
 
   static unsigned long lastRead = 0;
-  if (millis() - lastRead < 100) return;   // rate limit
+  static uint8_t failCount = 0;
+
+  if (millis() - lastRead < 100) return;  // rate limit
   lastRead = millis();
 
-  float r1 = NAN, r2 = NAN, r3 = NAN;
-
-  // Double / triple sampling to defeat noise
-  r1 = readUltrasonicRaw();
-  delay(20);
-  r2 = readUltrasonicRaw();
-  delay(20);
-  r3 = readUltrasonicRaw();
-
-  // Collect valid samples
   float samples[3];
   int count = 0;
 
-  if (!isnan(r1)) samples[count++] = r1;
-  if (!isnan(r2)) samples[count++] = r2;
-  if (!isnan(r3)) samples[count++] = r3;
+  float r;
+
+  r = readUltrasonicRaw();
+  if (!isnan(r)) samples[count++] = r;
+  vTaskDelay(pdMS_TO_TICKS(20));
+
+  r = readUltrasonicRaw();
+  if (!isnan(r)) samples[count++] = r;
+  vTaskDelay(pdMS_TO_TICKS(20));
+
+  r = readUltrasonicRaw();
+  if (!isnan(r)) samples[count++] = r;
 
   if (count == 0) {
-    LOG_ERROR("Ultrasonic: no valid samples");
+    failCount++;
+    LOG_ERROR("Ultrasonic: no valid samples (%d)", failCount);
+
+    if (failCount >= ULTRASONIC_FAIL_THRESHOLD) {
+      reinitUltrasonicUART();
+      failCount = 0;
+    }
     return;
   }
 
-  // Simple median/average logic
+  failCount = 0;
+
+  // Median / average logic
   float newDistance;
+
   if (count == 1) {
     newDistance = samples[0];
-  } else if (count == 2) {
-    newDistance = (samples[0] + samples[1]) / 2.0f;
-  } else {
-    // median of 3
+  } 
+  else if (count == 2) {
+    newDistance = (samples[0] + samples[1]) * 0.5f;
+  } 
+  else {
     if ((samples[0] <= samples[1] && samples[1] <= samples[2]) ||
         (samples[2] <= samples[1] && samples[1] <= samples[0])) {
       newDistance = samples[1];
@@ -2052,21 +2129,19 @@ void measureUltrasonicDistance() {
     }
   }
 
-  // 🔒 Protect shared variable
   xSemaphoreTake(ultrasonicMutex, portMAX_DELAY);
 
-  // Reject unrealistic jumps (tank level cannot teleport)
   if (!isnan(distance) && fabs(newDistance - distance) > 5.0f) {
-    LOG_ERROR("Ultrasonic spike rejected: %.2f → %.2f", distance, newDistance);
+    LOG_ERROR("Ultrasonic spike rejected: %.2f -> %.2f", distance, newDistance);
     xSemaphoreGive(ultrasonicMutex);
     return;
   }
 
   distance = newDistance;
-  // Serial.printf("Ultrasonic OK: %.2f cm\n", distance);
 
   xSemaphoreGive(ultrasonicMutex);
 }
+
 
 ///======== SYSTEM UTILITIES SECTION =======//
 // CPU usage (diagnostic only, low overhead)
