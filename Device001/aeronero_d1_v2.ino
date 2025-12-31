@@ -21,7 +21,7 @@
 #include <Preferences.h>
 #define MIN_VALID_PULSES 3
 
-#define TDS_CAL_ULTRA_LOW  2.54f   // <20 ppm correction
+#define TDS_CAL_ULTRA_LOW 2.54f  // <20 ppm correction
 #define ULTRASONIC_FAIL_THRESHOLD 5
 // PH
 // ==== USER CALIBRATION VALUES FROM YOUR SENSOR ====
@@ -104,6 +104,11 @@ unsigned long flowStopDelay = 5000;
 static unsigned long lastFlowTime = 0;
 float sessionLiters = 0.0f;  // counts only this flow session
 // Configuration struct for device settings
+#define ULTRASONIC_FAIL_THRESHOLD 5
+#define SENSOR_RESPONSE_TIMEOUT_MS 200  // 5-140ms typical
+#define SENSOR_BOOT_TIME_MS 1000
+#define MEASUREMENT_INTERVAL_MS 5000  // 5 seconds
+
 struct Config {
   char deviceId[32];
   char type[10];
@@ -138,7 +143,6 @@ HardwareSerial sensorSerial(1);
 #define SCL_PIN 9
 const int WIFI_LED = 37;
 const int BUZZER_PIN = 45;
-const int dataStatus = 15;
 const int tdsPin = 2;
 const int RESET_PIN = 36;  //
 const int flowSensorPin = 5;
@@ -234,7 +238,7 @@ uint8_t AQI = 0;
 uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "2.0.8";
+const char* current_firmware_version = "2.0.9";
 ///======== FORWARD DECLARATIONS SECTION =======//
 // Forward declarations for functions to ensure compilation order
 float readCounter(const char* key, float defaultValue);
@@ -542,7 +546,7 @@ void readTDSSensor(float temperature) {
   if (smoothRaw < 20.0f) {
     calibratedTDS = smoothRaw * TDS_CAL_ULTRA_LOW;
   } else {
-     range = detectTDSRange(smoothRaw);
+    range = detectTDSRange(smoothRaw);
     calibratedTDS = smoothRaw * TDS_CAL_RANGE[range];
   }
   // Final sanity check
@@ -908,90 +912,123 @@ bool getLatestReadings(float& temperature, float& humidity,
 ///======== RELAY CONTROL SECTION =======//
 // Relay control task with environmental checks (optimized: hysteresis and delays for stability)
 void checkRelayTask(void* pvParameters) {
+
   static int lastRelayState = digitalRead(RELAY1_PIN);
   static int lastPumpState = digitalRead(RELAY2_PIN);
   static unsigned long lastMinuteCheck = 0;
-  // Diagnostic: Task started, restore compressor minutes
+
   compressorMinutes = readCounterULong("compMinutes", 0);
+
   if (lastRelayState == LOW) {
     compStartTime = millis();
     lastMinuteCheck = compStartTime;
   }
+
   while (true) {
-    getLatestReadings(temperature, humidity, AQI, TVOC, ECO2);
-    // Validate sensor ranges for diagnostics
-    bool tempValid = (!isnan(temperature) && temperature >= -40 && temperature <= 125 && temperature != 0.0);
-    bool humValid = (!isnan(humidity) && humidity >= 1 && humidity <= 100);
-    bool distValid = (distance >= 3 && distance <= 500);  // mandatory
-    // Skip if distance invalid
-    if (!distValid) {
-      LOG_ERROR("Distance invalid (%.2f cm). Skipping control logic.", distance);
+
+    /* ================= DISTANCE SNAPSHOT ================= */
+
+    float distanceSnapshot = NAN;
+
+    if (xSemaphoreTake(ultrasonicMutex, pdMS_TO_TICKS(50))) {
+      distanceSnapshot = distance;
+      xSemaphoreGive(ultrasonicMutex);
+    } else {
+      LOG_ERROR("RelayTask: ultrasonic mutex timeout");
       vTaskDelay(1000 / portTICK_PERIOD_MS);
       continue;
     }
-    // Environmental checks
-    bool tempOutOfRange = (tempValid && (temperature < config.tempThresholdMin || temperature > config.tempThresholdMax));
-    bool humOutOfRange = (humValid && (humidity < config.humidityThresholdMin || humidity > config.humidityThresholdMax));
-    // OFF: Tank full
-    if (distance <= config.compressorOffLevel) {
+
+    /* ================= SENSOR WRITE (FIX) ================= */
+
+    if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
+      getLatestReadings(temperature, humidity, AQI, TVOC, ECO2);
+      xSemaphoreGive(sensorMutex);
+    } else {
+      LOG_ERROR("RelayTask: sensor mutex timeout");
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    /* ================= VALIDATION ================= */
+
+    bool tempValid = (!isnan(temperature) && temperature >= -40 && temperature <= 125 && temperature != 0.0);
+
+    bool humValid = (!isnan(humidity) && humidity >= 1 && humidity <= 100);
+
+    bool distValid = (distanceSnapshot >= 3 && distanceSnapshot <= 500);
+
+    if (!distValid) {
+      LOG_ERROR("Distance invalid (%.2f cm). Skipping control logic.", distanceSnapshot);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    bool tempOutOfRange =
+      (tempValid && (temperature < config.tempThresholdMin || temperature > config.tempThresholdMax));
+
+    bool humOutOfRange =
+      (humValid && (humidity < config.humidityThresholdMin || humidity > config.humidityThresholdMax));
+
+    /* ================= COMPRESSOR CONTROL ================= */
+
+    if (distanceSnapshot <= config.compressorOffLevel) {
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
         compStartTime = 0;
-        LOG_ERROR("Relay OFF → Compressor stopped (Reason: Tank full)");  // Log as warn, but per request treat as error
+        LOG_ERROR("Relay OFF → Compressor stopped (Tank full)");
       }
-    }
-    // OFF: Env out of range
-    else if (tempOutOfRange || humOutOfRange) {
+    } else if (tempOutOfRange || humOutOfRange) {
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
         compStartTime = 0;
-        LOG_ERROR("Relay OFF → Compressor stopped (Reason: Env out of range)");
+        LOG_ERROR("Relay OFF → Compressor stopped (Env out of range)");
       }
-    }
-    // ON: Tank low + 3-min hysteresis
-    else if (distance >= config.compressorOnLevel) {
+    } else if (distanceSnapshot >= config.compressorOnLevel) {
       if (lastRelayState != LOW) {
-        if (millis() - lastRelayOffTime >= 180000) {  // 3-min delay
+        if (millis() - lastRelayOffTime >= 180000) {
           digitalWrite(RELAY1_PIN, LOW);
           lastRelayState = LOW;
           compStartTime = millis();
           lastMinuteCheck = compStartTime;
-          // Success: Compressor started (no log)
         } else {
-          LOG_ERROR("Relay ON blocked (waiting 3 min since OFF)");
+          LOG_ERROR("Relay ON blocked (3 min hysteresis)");
         }
       }
     }
-    // Pump logic: OFF when off level reached (tank full/high level)
-    if (distance >= config.pumpOffLevel) {
+
+    /* ================= PUMP CONTROL ================= */
+
+    if (distanceSnapshot <= config.pumpOffLevel) {
       if (lastPumpState != HIGH) {
         digitalWrite(RELAY2_PIN, HIGH);
         lastPumpState = HIGH;
-        LOG_ERROR("Pump OFF (Reason: Off level reached - tank full)");
+        LOG_ERROR("Pump OFF (Tank full)");
       }
-    }
-    // ON when below off level (tank low/low level)
-    else {
+    } else {
       if (lastPumpState != LOW) {
         digitalWrite(RELAY2_PIN, LOW);
         lastPumpState = LOW;
-        LOG_ERROR("Pump ON (Reason: Below off level - tank low)");
+        LOG_ERROR("Pump ON (Tank low)");
       }
     }
-    // Minute tracking
-    if (lastRelayState == LOW && (millis() - lastMinuteCheck >= 60000)) {
+
+    /* ================= RUNTIME TRACKING ================= */
+
+    if (lastRelayState == LOW && millis() - lastMinuteCheck >= 60000) {
       compressorMinutes++;
       saveCounterULong("compMinutes", compressorMinutes);
       lastMinuteCheck += 60000;
-      // Success: Runtime incremented (no log)
     }
+
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
+
 ///======== CONNECTIVITY SECTION =======//
 // Internet check (optimized: simple DNS ping)
 bool hasInternetConnection() {
@@ -1501,14 +1538,36 @@ void sendViaGSM() {
     LOG_ERROR("Failed to get Unix timestamp, using millis()");
     timestamp = millis() / 1000;
   }
- /* ================= SAFE DISTANCE READ ================= */
+
+  /* ================= SAFE DISTANCE READ ================= */
   float distanceToSend = NAN;
-  if (xSemaphoreTake(ultrasonicMutex, portMAX_DELAY)) {
+  if (xSemaphoreTake(ultrasonicMutex, pdMS_TO_TICKS(50))) {
     distanceToSend = distance;
     xSemaphoreGive(ultrasonicMutex);
+  } else {
+    LOG_ERROR("sendViaGSM: ultrasonic mutex timeout");
   }
+
+  /* ================= SENSOR SNAPSHOT (ONLY ADDITION) ================= */
+
+  float temperatureSnap = NAN;
+  float humiditySnap = NAN;
+  uint8_t AQISnap = 0;
+  uint16_t TVOCSnap = 0;
+  uint16_t ECO2Snap = 0;
+
+  if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
+    temperatureSnap = temperature;
+    humiditySnap = humidity;
+    AQISnap = AQI;
+    TVOCSnap = TVOC;
+    ECO2Snap = ECO2;
+    xSemaphoreGive(sensorMutex);
+  } else {
+    LOG_ERROR("sendViaGSM: sensor mutex timeout");
+  }
+
   /* ================= JSON BUILD ================= */
- 
   StaticJsonDocument<1536> doc;
 
   doc["TimeStamp"] = timestamp;
@@ -1516,17 +1575,17 @@ void sendViaGSM() {
   doc["DeviceName"] = "AeroneroControlSystem";
   doc["DeviceFirmwareVersion"] = current_firmware_version;
 
-  /* ================= SENSOR VALUES (2 DECIMALS ONLY IN JSON) ================= */
+  /* ================= SENSOR VALUES ================= */
 
   jsonFloat2(doc, "Temperature",
-             (isnan(temperature) || temperature < -40 || temperature > 125 || temperature == 0.0)
+             (isnan(temperatureSnap) || temperatureSnap < -40 || temperatureSnap > 125 || temperatureSnap == 0.0)
                ? NAN
-               : temperature);
+               : temperatureSnap);
 
   jsonFloat2(doc, "Humidity",
-             (isnan(humidity) || humidity < 1 || humidity > 100)
+             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)
                ? NAN
-               : humidity);
+               : humiditySnap);
 
   jsonFloat2(doc, "WaterTankLevel",
              (distanceToSend < 3 || distanceToSend > 500)
@@ -1546,8 +1605,8 @@ void sendViaGSM() {
                ? NAN
                : savedTds);
 
-  /* ================= AIR QUALITY (INTEGERS) ================= */
-  /* ================= AIR QUALITY (INTEGERS) ================= */
+  /* ================= AIR QUALITY ================= */
+
 
   if (AQI < 1 || AQI > 5) {
     doc["AQI"] = nullptr;
@@ -1566,16 +1625,16 @@ void sendViaGSM() {
   } else {
     doc["ECO2"] = ECO2;
   }
-
   /* ================= COUNTERS ================= */
 
-  float savedLiters = readCounter("totalLiters", 0.0f);
   unsigned long motor = readCounterULong("motorMinutes", 0);
   unsigned long compressor = readCounterULong("compMinutes", 0);
 
   float litersToSend = 0.0f;
 
   if (!flowFlag) {
+
+    float savedLiters = readCounter("totalLiters", 0.0f);
     litersToSend = savedLiters;
     if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
   } else {
@@ -1599,16 +1658,12 @@ void sendViaGSM() {
   doc["AirQualityRegulationRegion"] = "India";
 
   /* ================= SERIALIZE ================= */
+
   char jsonBuffer[1536];
-
-  size_t len = serializeJson(
-    doc,
-    jsonBuffer,
-    sizeof(jsonBuffer)
-  );
-
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
 
   /* ================= MQTT PUBLISH WITH RETRY ================= */
+
   bool success = false;
   int retryDelay = 100;
 
@@ -1628,6 +1683,7 @@ void sendViaGSM() {
   }
 
   /* ================= POST-PUBLISH HANDLING ================= */
+
   if (success) {
 
     if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
@@ -1652,10 +1708,6 @@ void sendViaGSM() {
       LOG_ERROR("Failed to take prefsMutex to reset counters");
     }
 
-    digitalWrite(dataStatus, HIGH);
-    delay(2000);
-    digitalWrite(dataStatus, LOW);
-
     mqttFailureCount = 0;
 
   } else {
@@ -1665,6 +1717,7 @@ void sendViaGSM() {
 
   lastKeepAliveTime = millis();
 }
+
 
 
 
@@ -1820,30 +1873,52 @@ void sendViaWIFI() {
 
   /* ================= SAFE DISTANCE READ ================= */
   float distanceToSend = NAN;
-  if (xSemaphoreTake(ultrasonicMutex, portMAX_DELAY)) {
+
+  if (xSemaphoreTake(ultrasonicMutex, pdMS_TO_TICKS(50))) {
     distanceToSend = distance;
     xSemaphoreGive(ultrasonicMutex);
+  } else {
+    LOG_ERROR("sendViaWIFI: ultrasonic mutex timeout");
   }
+
+  /* ================= SENSOR SNAPSHOT (ONLY ADDITION) ================= */
+
+  float temperatureSnap = NAN;
+  float humiditySnap = NAN;
+  uint8_t AQISnap = 0;
+  uint16_t TVOCSnap = 0;
+  uint16_t ECO2Snap = 0;
+
+  if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
+    temperatureSnap = temperature;
+    humiditySnap = humidity;
+    AQISnap = AQI;
+    TVOCSnap = TVOC;
+    ECO2Snap = ECO2;
+    xSemaphoreGive(sensorMutex);
+  } else {
+    LOG_ERROR("sendViaWIFI: sensor mutex timeout");
+  }
+
   /* ================= JSON BUILD ================= */
   StaticJsonDocument<1024> doc;
-
 
   doc["TimeStamp"] = timestamp;
   doc["DeviceId"] = config.deviceId;
   doc["DeviceName"] = "AeroneroControlSystem";
   doc["DeviceFirmwareVersion"] = current_firmware_version;
 
-  /* ================= SENSOR VALUES (2 DECIMALS ONLY IN JSON) ================= */
+  /* ================= SENSOR VALUES ================= */
 
   jsonFloat2(doc, "Temperature",
-             (isnan(temperature) || temperature < -40 || temperature > 125 || temperature == 0.0)
+             (isnan(temperatureSnap) || temperatureSnap < -40 || temperatureSnap > 125 || temperatureSnap == 0.0)
                ? NAN
-               : temperature);
+               : temperatureSnap);
 
   jsonFloat2(doc, "Humidity",
-             (isnan(humidity) || humidity < 1 || humidity > 100)
+             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)
                ? NAN
-               : humidity);
+               : humiditySnap);
 
   jsonFloat2(doc, "WaterTankLevel",
              (distanceToSend < 3 || distanceToSend > 500)
@@ -1863,8 +1938,8 @@ void sendViaWIFI() {
                ? NAN
                : savedTds);
 
-  /* ================= AIR QUALITY (INTEGERS) ================= */
-  /* ================= AIR QUALITY (INTEGERS) ================= */
+  /* ================= AIR QUALITY ================= */
+
 
   if (AQI < 1 || AQI > 5) {
     doc["AQI"] = nullptr;
@@ -1886,13 +1961,14 @@ void sendViaWIFI() {
 
   /* ================= COUNTERS ================= */
 
-  float savedLiters = readCounter("totalLiters", 0.0f);
   unsigned long motor = readCounterULong("motorMinutes", 0);
   unsigned long comp = readCounterULong("compMinutes", 0);
 
   float litersToSend = 0.0f;
 
   if (!flowFlag) {
+
+    float savedLiters = readCounter("totalLiters", 0.0f);
     litersToSend = savedLiters;
     if (fabs(litersToSend) < 0.001f) litersToSend = 0.0f;
   } else {
@@ -1972,10 +2048,6 @@ void sendViaWIFI() {
       LOG_ERROR("Failed to take prefsMutex to reset counters");
     }
 
-    digitalWrite(dataStatus, HIGH);
-    delay(2000);
-    digitalWrite(dataStatus, LOW);
-
     mqttFailureCount = 0;
 
   } else {
@@ -1983,6 +2055,7 @@ void sendViaWIFI() {
     mqttFailureCount++;
   }
 }
+
 
 
 ///======== BUTTON AND BUZZER SECTION =======//
@@ -2011,40 +2084,33 @@ void buttonCheckTask(void* pvParameters) {
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
-//======== ULTRASONIC SECTION =======//
-void ultrasonicTask(void* pvParameters) {
-  while (true) {
-    measureUltrasonicDistance();  // ONLY PLACE WHERE WE READ THE SENSOR
-    vTaskDelay(30000 / portTICK_PERIOD_MS);
-  }
-}
-// Ultrasonic distance measurement (optimized: timeout and checksum validation)
-///======== ULTRASONIC SECTION (SAFE VERSION) =======//
-  //======== ULTRASONIC RAW READ =======//
+// ========== ULTRASONIC RAW READ (DYP-A22YYTW CONTROLLED) ==========
 float readUltrasonicRaw() {
   uint8_t buffer[4];
 
-  // Flush junk
-  while (sensorSerial.available()) {
+  // Flush junk safely (max 20 ms)
+  unsigned long t = millis();
+  while (sensorSerial.available() && millis() - t < 20) {
     sensorSerial.read();
   }
 
   // Trigger measurement
   sensorSerial.write(0x55);
 
+  // Wait for response (max 120 ms)
   unsigned long start = millis();
   while (sensorSerial.available() < 4) {
-    if (millis() - start > 250) {   // timeout
+    if (millis() - start > 120) {
       return NAN;
     }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 
   for (int i = 0; i < 4; i++) {
     buffer[i] = sensorSerial.read();
   }
 
-  // Header check
+  // Header validation
   if (buffer[0] != 0xFF) return NAN;
 
   // Checksum
@@ -2058,63 +2124,34 @@ float readUltrasonicRaw() {
 
   return cm;
 }
-void reinitUltrasonicUART() {
-  LOG_ERROR("Ultrasonic: UART reinitialization");
-
-  sensorSerial.end();
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  sensorSerial.setRxBufferSize(1024);
-  sensorSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
-}
-
-
-/// Safe wrapper for ultrasonic measurement
-//======== ULTRASONIC SAFE MEASUREMENT =======//
+// ========== ULTRASONIC SAFE MEASUREMENT ==========
 void measureUltrasonicDistance() {
 
-  static unsigned long lastRead = 0;
-  static uint8_t failCount = 0;
-
-  if (millis() - lastRead < 100) return;  // rate limit
-  lastRead = millis();
-
   float samples[3];
-  int count = 0;
+  int validCount = 0;
 
-  float r;
-
-  r = readUltrasonicRaw();
-  if (!isnan(r)) samples[count++] = r;
-  vTaskDelay(pdMS_TO_TICKS(20));
-
-  r = readUltrasonicRaw();
-  if (!isnan(r)) samples[count++] = r;
-  vTaskDelay(pdMS_TO_TICKS(20));
-
-  r = readUltrasonicRaw();
-  if (!isnan(r)) samples[count++] = r;
-
-  if (count == 0) {
-    failCount++;
-    LOG_ERROR("Ultrasonic: no valid samples (%d)", failCount);
-
-    if (failCount >= ULTRASONIC_FAIL_THRESHOLD) {
-      reinitUltrasonicUART();
-      failCount = 0;
+  // Take 3 samples
+  for (int i = 0; i < 3; i++) {
+    float r = readUltrasonicRaw();
+    if (!isnan(r)) {
+      samples[validCount++] = r;
     }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  // No valid data → keep last value
+  if (validCount == 0) {
+    LOG_ERROR("Ultrasonic: no valid sample, keeping %.2f cm", distance);
     return;
   }
 
-  failCount = 0;
-
-  // Median / average logic
+  // Median / average
   float newDistance;
 
-  if (count == 1) {
+  if (validCount == 1) {
     newDistance = samples[0];
   } 
-  else if (count == 2) {
+  else if (validCount == 2) {
     newDistance = (samples[0] + samples[1]) * 0.5f;
   } 
   else {
@@ -2129,17 +2166,25 @@ void measureUltrasonicDistance() {
     }
   }
 
+  // Smooth update (prevents spikes without freezing)
   xSemaphoreTake(ultrasonicMutex, portMAX_DELAY);
 
-  if (!isnan(distance) && fabs(newDistance - distance) > 5.0f) {
-    LOG_ERROR("Ultrasonic spike rejected: %.2f -> %.2f", distance, newDistance);
-    xSemaphoreGive(ultrasonicMutex);
-    return;
+  if (isnan(distance)) {
+    distance = newDistance;
+  } else {
+    distance = (distance * 0.7f) + (newDistance * 0.3f);
   }
 
-  distance = newDistance;
-
   xSemaphoreGive(ultrasonicMutex);
+}
+
+
+// ========== ULTRASONIC TASK ==========
+void ultrasonicTask(void* pvParameters) {
+  while (true) {
+    measureUltrasonicDistance();
+    vTaskDelay(pdMS_TO_TICKS(1000));   // 1 second – DO NOT INCREASE
+  }
 }
 
 
@@ -2530,8 +2575,20 @@ void setup() {
   Serial.println(current_firmware_version);
   delay(1000);
   delay(1000);
-  sensorSerial.setRxBufferSize(1024);
+  // Initialize UART with large buffer (prevents overflow during WiFi interrupts)
+  sensorSerial.setRxBufferSize(4096);
   sensorSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+  // Wait for sensor bootloader to complete
+  delay(SENSOR_BOOT_TIME_MS);
+
+  // Clear any garbage from sensor startup
+  while (sensorSerial.available()) {
+    sensorSerial.read();
+  }
+
+  LOG_ERROR("Ultrasonic sensor initialized (DYP-A22YYTW-V1.0)");
+
   pinMode(gsmRST, OUTPUT);
   Wire.begin(SDA_PIN, SCL_PIN);
   pinMode(RELAY1_PIN, OUTPUT);
@@ -2549,9 +2606,7 @@ void setup() {
   pinMode(flowSensorPin, INPUT_PULLUP);
   pinMode(WIFI_LED, OUTPUT);
   pinMode(tdsPin, INPUT);
-  pinMode(dataStatus, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(dataStatus, LOW);
   digitalWrite(WIFI_LED, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   ultrasonicMutex = xSemaphoreCreateMutex();
