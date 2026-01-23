@@ -21,6 +21,7 @@
 #include <Preferences.h>
 #define MIN_VALID_PULSES 3
 
+#define MAX_DIST_FAILS 10
 #define TDS_CAL_ULTRA_LOW 2.54f  // <20 ppm correction
 #define ULTRASONIC_FAIL_THRESHOLD 5
 // PH
@@ -32,6 +33,7 @@ float V_pH10 = 1060.47;     // mV
 // ESP32 ADC characteristics
 #define adcMax 4095
 #define Vref 3300.0
+#define MAX_PULSE_JUMP_RATIO 3.0f   // sudden spike protection
 ///======== GLOBAL VARIABLES AND STRUCTS SECTION =======//
 // Communication and failure tracking
 int gsmFailureCount = 0;
@@ -83,7 +85,6 @@ bool isMQTTConnected = false;
 bool loggedIn = false;  // Authentication flag
 
 // ===== FLOW SENSOR CONFIG =====
-#define FLOW_DIVISOR 7.5f        // Hz → L/min (YF-S201)
 #define PULSES_PER_LITER 450.0f  // adjust per sensor
 #define MIN_VALID_PULSES 3       // pulses/sec to confirm flow
 #define FLOW_CONFIRM_SEC 2       // seconds to confirm flow
@@ -108,7 +109,12 @@ float sessionLiters = 0.0f;  // counts only this flow session
 #define SENSOR_RESPONSE_TIMEOUT_MS 200  // 5-140ms typical
 #define SENSOR_BOOT_TIME_MS 1000
 #define MEASUREMENT_INTERVAL_MS 5000  // 5 seconds
-
+#define MAX_PULSES_PER_SEC 450
+  float temperatureSnap = NAN;
+  float humiditySnap = NAN;
+  uint8_t AQISnap = 0;
+  uint16_t TVOCSnap = 0;
+  uint16_t ECO2Snap = 0;
 struct Config {
   char deviceId[32];
   char type[10];
@@ -181,7 +187,7 @@ int logIndex = 0;
 float temperatureC = 25.0;
 const int SAMPLES = 100;
 const int SAMPLE_DELAY_MS = 20;
-// Preferences mutex for thread safety
+// Preferences mutex for thread safetyf
 SemaphoreHandle_t prefsMutex;
 // Global runtime variables
 unsigned long totalFlowMinutes = 0;
@@ -221,6 +227,7 @@ bool ensInitialized = false;
 volatile unsigned long lastInterruptTime = 0;
 
 const unsigned long DEBOUNCE_DELAY = 5;  // ms
+#define CHECKPOINT_INTERVAL_MS 30000  // 30 seconds
 
 const float tdsFactor = 0.5;
 
@@ -238,7 +245,7 @@ uint8_t AQI = 0;
 uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "2.0.9";
+const char* current_firmware_version = "2.1.3";
 ///======== FORWARD DECLARATIONS SECTION =======//
 // Forward declarations for functions to ensure compilation order
 float readCounter(const char* key, float defaultValue);
@@ -471,11 +478,11 @@ float stableReadPH() {
 // ===== Range-wise calibration factors =====
 const float TDS_CAL_RANGE[7] = {
   1.569,  // r0 < 50
-  1.006,  // r1 50–100
-  1.069,  // r2 100–200
-  1.230,  // r3 200–300
-  1.333,  // r4 300–600
-  1.461,  // r5 600–1000
+  1.569,  // r1 50–100
+  1.569,  // r2 100–200
+  1.569,  // r3 200–300
+  1.569,  // r4 300–600
+  1.569,  // r5 600–1000
   1.750   // r6 >1000
 };
 
@@ -623,113 +630,106 @@ void IRAM_ATTR countPulses() {
   static uint32_t lastMicros = 0;
   uint32_t now = micros();
 
-  if (now - lastMicros > 500) {  // 500 µs debounce
+  if (now - lastMicros > 2000) {  // 500 ms debounce
     pulseCount++;
     lastMicros = now;
   }
 }
+
 void flowSensorTask(void* pvParameters) {
 
-  // Restore counters on boot
-  totalLiters = readCounter("totalLiters", 0.0f);
+  // ===== RESTORE COUNTERS =====
+  totalLiters  = readCounter("totalLiters", 0.0f);
   motorMinutes = readCounterULong("motorMinutes", 0);
+  float pendingLiters = readCounter("pendingLiters", 0.0f);
+
+  uint32_t lastPulses = 0;
+  unsigned long lastCheckpointTime = millis();
+
+  Serial.printf("[INIT] Restored: total=%.3f, pending=%.3f\n", totalLiters, pendingLiters);
 
   while (true) {
 
-    /* ===== 1 SECOND MEASUREMENT WINDOW ===== */
+    // ===== 1-SECOND WINDOW =====
     noInterrupts();
     uint32_t pulses = pulseCount;
     pulseCount = 0;
     interrupts();
 
-    /* ===== FLOW RATE ===== */
-    flowRate = pulses / FLOW_DIVISOR;
+    // ===== SPIKE CHECKS =====
+    if (pulses > MAX_PULSES_PER_SEC) {
+      LOG_ERROR("FLOW SPIKE (MAX LIMIT): %lu", pulses);
+      pulses = 0;
+      validFlowCount = 0;
+      pendingLiters = 0.0f;
+    }
 
-    Serial.printf(
-      "Flow Sensor - Pulses: %lu, Flow Rate: %.2f L/min\n",
-      pulses, flowRate);
+    if (lastPulses > 0 && pulses > 0) {
+      float jump = (float)pulses / lastPulses;
+      if (jump > MAX_PULSE_JUMP_RATIO) {
+        LOG_ERROR("FLOW SPIKE (JUMP): %lu -> %lu", lastPulses, pulses);
+        pulses = 0;
+        validFlowCount = 0;
+        pendingLiters = 0.0f;
+      }
+    }
+    lastPulses = pulses;
 
-    /* ===== VALID FLOW CHECK ===== */
+    // ===== FLOW RATE DISPLAY =====
+    flowRate = (pulses * 60.0f) / PULSES_PER_LITER;
+
+    // ===== VALID FLOW CHECK =====
     if (pulses >= MIN_VALID_PULSES) {
       validFlowCount++;
+      lastFlowTime = millis();
+      pendingLiters += pulses / PULSES_PER_LITER;
     } else {
       validFlowCount = 0;
     }
 
-    /* ===== SESSION VOLUME ===== */
-    if (flowFlag && pulses >= MIN_VALID_PULSES) {
-      float volumeIncrement = pulses / PULSES_PER_LITER;
-      sessionLiters += volumeIncrement;
-
-      Serial.printf(
-        "Flow Sensor - Session Liters: %.3f\n",
-        sessionLiters);
+    // ===== FLOW CONFIRM =====
+    if (validFlowCount >= FLOW_CONFIRM_SEC && !flowFlag) {
+      flowFlag = true;
+      flowStartTime = millis();
+      lastCheckpointTime = millis();
+      Serial.println("Flow CONFIRMED");
     }
 
-    /* ===== FLOW START (CONFIRMED) ===== */
-    if (validFlowCount >= FLOW_CONFIRM_SEC) {
-
-      lastFlowTime = millis();
-
-      if (!flowFlag) {
-        flowFlag = true;
-        sessionLiters = 0.0f;
-        flowStartTime = millis();
-        Serial.println("Flow Sensor - CONFIRMED flow, relay ON");
-
-        if (phTaskHandle == NULL) {
-          BaseType_t res = xTaskCreatePinnedToCore(
-            phTdsTask,
-            "phTdsTask",
-            10240,
-            NULL,
-            1,
-            &phTaskHandle,
-            1);
-
-          if (res != pdPASS) {
-            LOG_ERROR("Failed to create phTdsTask");
-            phTaskHandle = NULL;
-          }
-        }
+    // ===== PERIODIC CHECKPOINT =====
+    if (flowFlag && millis() - lastCheckpointTime >= CHECKPOINT_INTERVAL_MS) {
+      if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
+        prefs.begin("counters", false);
+        prefs.putFloat("pendingLiters", pendingLiters);
+        prefs.end();
+        xSemaphoreGive(prefsMutex);
       }
+      lastCheckpointTime = millis();
+      Serial.printf("Checkpoint saved: %.3f L\n", pendingLiters);
     }
 
-    /* ===== FLOW STOP ===== */
-    if (flowFlag && pulses == 0 && (millis() - lastFlowTime >= flowStopDelay)) {
-
+    // ===== FLOW STOP =====
+    if (flowFlag && pulses < MIN_VALID_PULSES && (millis() - lastFlowTime >= flowStopDelay)) {
       flowFlag = false;
       validFlowCount = 0;
-
 
       unsigned long flowDurationMs = millis() - flowStartTime;
       unsigned long flowDurationMinutes = flowDurationMs / 60000;
 
-      Serial.printf(
-        "Flow Sensor - Flow stopped after %lu ms (%lu minutes)\n",
-        flowDurationMs,
-        flowDurationMinutes);
-
-      /* ===== SAVE COUNTERS ===== */
       if (xSemaphoreTake(prefsMutex, portMAX_DELAY)) {
-
+        totalLiters  += pendingLiters;
         motorMinutes += flowDurationMinutes;
-        totalLiters += sessionLiters;
 
         prefs.begin("counters", false);
         prefs.putFloat("totalLiters", totalLiters);
         prefs.putULong("motorMinutes", motorMinutes);
+        prefs.putFloat("pendingLiters", 0.0f);  // Clear after commit
         prefs.end();
-
         xSemaphoreGive(prefsMutex);
-
-        Serial.printf(
-          "Flow Sensor - Total Liters: %.3f, Motor Minutes: %lu\n",
-          totalLiters,
-          motorMinutes);
       }
 
-      sessionLiters = 0.0f;
+      Serial.printf("Flow STOPPED | Added: %.3f L | Total: %.3f L\n",
+                    pendingLiters, totalLiters);
+      pendingLiters = 0.0f;
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -909,18 +909,28 @@ bool getLatestReadings(float& temperature, float& humidity,
   return (shtOK && ensInitialized);
 }
 
+
+
 ///======== RELAY CONTROL SECTION =======//
 // Relay control task with environmental checks (optimized: hysteresis and delays for stability)
+
+
 void checkRelayTask(void* pvParameters) {
 
   static int lastRelayState = digitalRead(RELAY1_PIN);
-  static int lastPumpState = digitalRead(RELAY2_PIN);
-  static unsigned long lastMinuteCheck = 0;
+  static int lastPumpState  = digitalRead(RELAY2_PIN);
+
+  static unsigned long lastMinuteCheck   = 0;
+  static unsigned long lastRelayOffTime  = 0;
+  static unsigned long compStartTime     = 0;
+
+  static uint8_t distFailCount = 0;
+  static bool sensorFailMode   = false;
 
   compressorMinutes = readCounterULong("compMinutes", 0);
 
   if (lastRelayState == LOW) {
-    compStartTime = millis();
+    compStartTime   = millis();
     lastMinuteCheck = compStartTime;
   }
 
@@ -935,66 +945,121 @@ void checkRelayTask(void* pvParameters) {
       xSemaphoreGive(ultrasonicMutex);
     } else {
       LOG_ERROR("RelayTask: ultrasonic mutex timeout");
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
-    /* ================= SENSOR WRITE (FIX) ================= */
+    /* ================= SENSOR READ ================= */
 
     if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
       getLatestReadings(temperature, humidity, AQI, TVOC, ECO2);
       xSemaphoreGive(sensorMutex);
     } else {
       LOG_ERROR("RelayTask: sensor mutex timeout");
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
-      continue;
     }
 
     /* ================= VALIDATION ================= */
 
-    bool tempValid = (!isnan(temperature) && temperature >= -40 && temperature <= 125 && temperature != 0.0);
+    bool tempValid = (!isnan(temperature) &&
+                      temperature >= -40 &&
+                      temperature <= 125 &&
+                      temperature != 0.0);
 
-    bool humValid = (!isnan(humidity) && humidity >= 1 && humidity <= 100);
+    bool humValid  = (!isnan(humidity) &&
+                      humidity >= 1 &&
+                      humidity <= 100);
 
-    bool distValid = (distanceSnapshot >= 3 && distanceSnapshot <= 500);
+    bool distValid = (distanceSnapshot >= 3 &&
+                      distanceSnapshot <= 500);
+
+    /* ================= DISTANCE FAIL HANDLING ================= */
 
     if (!distValid) {
-      LOG_ERROR("Distance invalid (%.2f cm). Skipping control logic.", distanceSnapshot);
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
-      continue;
+      distFailCount++;
+      LOG_ERROR("Invalid distance %.2f cm (%d/%d)",
+                distanceSnapshot, distFailCount, MAX_DIST_FAILS);
+    } else {
+      distFailCount = 0;
+      sensorFailMode = false;
     }
 
+    if (distFailCount >= MAX_DIST_FAILS) {
+      sensorFailMode = true;
+    }
+
+    /* ================= FAIL-SAFE MODE ================= */
+
+    if (sensorFailMode) {
+      LOG_ERROR("FAIL-SAFE MODE: Ultrasonic sensor failed");
+
+      // Compressor ON
+      if (lastRelayState != LOW) {
+        digitalWrite(RELAY1_PIN, LOW);
+        lastRelayState = LOW;
+        compStartTime = millis();
+        lastMinuteCheck = compStartTime;
+      }
+
+      // Pump ON
+      if (lastPumpState != LOW) {
+        digitalWrite(RELAY2_PIN, LOW);
+        lastPumpState = LOW;
+      }
+
+      // Runtime tracking still valid
+      if (millis() - lastMinuteCheck >= 60000) {
+        compressorMinutes++;
+        saveCounterULong("compMinutes", compressorMinutes);
+        lastMinuteCheck += 60000;
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;   // Skip normal logic
+    }
+
+    /* ================= ENVIRONMENT CHECK ================= */
+
     bool tempOutOfRange =
-      (tempValid && (temperature < config.tempThresholdMin || temperature > config.tempThresholdMax));
+      (tempValid &&
+       (temperature < config.tempThresholdMin ||
+        temperature > config.tempThresholdMax));
 
     bool humOutOfRange =
-      (humValid && (humidity < config.humidityThresholdMin || humidity > config.humidityThresholdMax));
+      (humValid &&
+       (humidity < config.humidityThresholdMin ||
+        humidity > config.humidityThresholdMax));
 
     /* ================= COMPRESSOR CONTROL ================= */
 
     if (distanceSnapshot <= config.compressorOffLevel) {
+
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
         compStartTime = 0;
-        LOG_ERROR("Relay OFF → Compressor stopped (Tank full)");
+        LOG_ERROR("Relay OFF → Tank full");
       }
+
     } else if (tempOutOfRange || humOutOfRange) {
+
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
         lastRelayState = HIGH;
         lastRelayOffTime = millis();
         compStartTime = 0;
-        LOG_ERROR("Relay OFF → Compressor stopped (Env out of range)");
+        LOG_ERROR("Relay OFF → Environment out of range");
       }
+
     } else if (distanceSnapshot >= config.compressorOnLevel) {
+
       if (lastRelayState != LOW) {
-        if (millis() - lastRelayOffTime >= 180000) {
+        if (millis() - lastRelayOffTime >= 180000) { // 3 min hysteresis
           digitalWrite(RELAY1_PIN, LOW);
           lastRelayState = LOW;
           compStartTime = millis();
           lastMinuteCheck = compStartTime;
+          LOG_ERROR("Relay ON → Compressor started");
         } else {
           LOG_ERROR("Relay ON blocked (3 min hysteresis)");
         }
@@ -1003,31 +1068,37 @@ void checkRelayTask(void* pvParameters) {
 
     /* ================= PUMP CONTROL ================= */
 
-    if (distanceSnapshot <= config.pumpOffLevel) {
+    if (distanceSnapshot >= config.pumpOffLevel) {
+
       if (lastPumpState != HIGH) {
         digitalWrite(RELAY2_PIN, HIGH);
         lastPumpState = HIGH;
-        LOG_ERROR("Pump OFF (Tank full)");
+        LOG_ERROR("Pump OFF → Tank full");
       }
+
     } else {
+
       if (lastPumpState != LOW) {
         digitalWrite(RELAY2_PIN, LOW);
         lastPumpState = LOW;
-        LOG_ERROR("Pump ON (Tank low)");
+        LOG_ERROR("Pump ON → Tank low");
       }
     }
 
     /* ================= RUNTIME TRACKING ================= */
 
-    if (lastRelayState == LOW && millis() - lastMinuteCheck >= 60000) {
+    if (lastRelayState == LOW &&
+        millis() - lastMinuteCheck >= 60000) {
+
       compressorMinutes++;
       saveCounterULong("compMinutes", compressorMinutes);
       lastMinuteCheck += 60000;
     }
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
+
 
 ///======== CONNECTIVITY SECTION =======//
 // Internet check (optimized: simple DNS ping)
@@ -1550,11 +1621,7 @@ void sendViaGSM() {
 
   /* ================= SENSOR SNAPSHOT (ONLY ADDITION) ================= */
 
-  float temperatureSnap = NAN;
-  float humiditySnap = NAN;
-  uint8_t AQISnap = 0;
-  uint16_t TVOCSnap = 0;
-  uint16_t ECO2Snap = 0;
+  
 
   if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
     temperatureSnap = temperature;
@@ -1883,11 +1950,7 @@ void sendViaWIFI() {
 
   /* ================= SENSOR SNAPSHOT (ONLY ADDITION) ================= */
 
-  float temperatureSnap = NAN;
-  float humiditySnap = NAN;
-  uint8_t AQISnap = 0;
-  uint16_t TVOCSnap = 0;
-  uint16_t ECO2Snap = 0;
+
 
   if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(50))) {
     temperatureSnap = temperature;
