@@ -105,7 +105,6 @@ unsigned long flowStopDelay = 5000;
 static unsigned long lastFlowTime = 0;
 float sessionLiters = 0.0f;  // counts only this flow session
 // Configuration struct for device settings
-#define ULTRASONIC_FAIL_THRESHOLD 5
 #define SENSOR_RESPONSE_TIMEOUT_MS 200  // 5-140ms typical
 #define SENSOR_BOOT_TIME_MS 1000
 #define MEASUREMENT_INTERVAL_MS 5000  // 5 seconds
@@ -245,7 +244,7 @@ uint8_t AQI = 0;
 uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "2.1.3";
+const char* current_firmware_version = "2.1.7";
 ///======== FORWARD DECLARATIONS SECTION =======//
 // Forward declarations for functions to ensure compilation order
 float readCounter(const char* key, float defaultValue);
@@ -636,6 +635,7 @@ void IRAM_ATTR countPulses() {
   }
 }
 
+
 void flowSensorTask(void* pvParameters) {
 
   // ===== RESTORE COUNTERS =====
@@ -693,6 +693,20 @@ void flowSensorTask(void* pvParameters) {
       flowStartTime = millis();
       lastCheckpointTime = millis();
       Serial.println("Flow CONFIRMED");
+         // Start PH/TDS task if not running
+        if (phTaskHandle == NULL) {
+          if (xTaskCreatePinnedToCore(
+                phTdsTask,
+                "phTdsTask",
+                10240,
+                NULL,
+                1,
+                &phTaskHandle,
+                1) != pdPASS) {
+            phTaskHandle = NULL;
+            LOG_ERROR("Failed to start phTdsTask");
+          }
+        }
     }
 
     // ===== PERIODIC CHECKPOINT =====
@@ -735,6 +749,7 @@ void flowSensorTask(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
+
 
 
 ///======== SENSOR INITIALIZATION SECTION =======//
@@ -920,12 +935,14 @@ void checkRelayTask(void* pvParameters) {
   static int lastRelayState = digitalRead(RELAY1_PIN);
   static int lastPumpState  = digitalRead(RELAY2_PIN);
 
-  static unsigned long lastMinuteCheck   = 0;
-  static unsigned long lastRelayOffTime  = 0;
-  static unsigned long compStartTime     = 0;
+  static unsigned long lastMinuteCheck  = 0;
+  static unsigned long lastRelayOffTime = 0;
+  static unsigned long compStartTime    = 0;
 
   static uint8_t distFailCount = 0;
   static bool sensorFailMode   = false;
+
+  static float lastValidDistance = NAN;
 
   compressorMinutes = readCounterULong("compMinutes", 0);
 
@@ -958,21 +975,21 @@ void checkRelayTask(void* pvParameters) {
       LOG_ERROR("RelayTask: sensor mutex timeout");
     }
 
-    /* ================= VALIDATION ================= */
+    /* ================= DISTANCE VALIDATION ================= */
 
-    bool tempValid = (!isnan(temperature) &&
-                      temperature >= -40 &&
-                      temperature <= 125 &&
-                      temperature != 0.0);
+    bool distValid =
+      !isnan(distanceSnapshot) &&
+      distanceSnapshot >= 3 &&
+      distanceSnapshot <= 500;
 
-    bool humValid  = (!isnan(humidity) &&
-                      humidity >= 1 &&
-                      humidity <= 100);
-
-    bool distValid = (distanceSnapshot >= 3 &&
-                      distanceSnapshot <= 500);
-
-    /* ================= DISTANCE FAIL HANDLING ================= */
+    // Spike rejection (sudden jump)
+    if (distValid && !isnan(lastValidDistance)) {
+      if (fabs(distanceSnapshot - lastValidDistance) > 50) {
+        LOG_ERROR("Distance spike rejected: %.2f → %.2f",
+                  lastValidDistance, distanceSnapshot);
+        distValid = false;
+      }
+    }
 
     if (!distValid) {
       distFailCount++;
@@ -981,6 +998,7 @@ void checkRelayTask(void* pvParameters) {
     } else {
       distFailCount = 0;
       sensorFailMode = false;
+      lastValidDistance = distanceSnapshot;
     }
 
     if (distFailCount >= MAX_DIST_FAILS) {
@@ -990,7 +1008,8 @@ void checkRelayTask(void* pvParameters) {
     /* ================= FAIL-SAFE MODE ================= */
 
     if (sensorFailMode) {
-      LOG_ERROR("FAIL-SAFE MODE: Ultrasonic sensor failed");
+
+      LOG_ERROR("FAIL-SAFE MODE: Ultrasonic sensor failure");
 
       // Compressor ON
       if (lastRelayState != LOW) {
@@ -1014,24 +1033,37 @@ void checkRelayTask(void* pvParameters) {
       }
 
       vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;   // Skip normal logic
+      continue;
     }
 
-    /* ================= ENVIRONMENT CHECK ================= */
+    /* ================= USE ONLY VERIFIED DISTANCE ================= */
+
+    float safeDistance = lastValidDistance;
+
+    /* ================= ENVIRONMENT VALIDATION ================= */
+
+    bool tempValid = !isnan(temperature) &&
+                     temperature >= -40 &&
+                     temperature <= 125 &&
+                     temperature != 0.0;
+
+    bool humValid  = !isnan(humidity) &&
+                     humidity >= 1 &&
+                     humidity <= 100;
 
     bool tempOutOfRange =
-      (tempValid &&
-       (temperature < config.tempThresholdMin ||
-        temperature > config.tempThresholdMax));
+      tempValid &&
+      (temperature < config.tempThresholdMin ||
+       temperature > config.tempThresholdMax);
 
     bool humOutOfRange =
-      (humValid &&
-       (humidity < config.humidityThresholdMin ||
-        humidity > config.humidityThresholdMax));
+      humValid &&
+      (humidity < config.humidityThresholdMin ||
+       humidity > config.humidityThresholdMax);
 
     /* ================= COMPRESSOR CONTROL ================= */
 
-    if (distanceSnapshot <= config.compressorOffLevel) {
+    if (safeDistance <= config.compressorOffLevel) {
 
       if (lastRelayState != HIGH) {
         digitalWrite(RELAY1_PIN, HIGH);
@@ -1051,24 +1083,22 @@ void checkRelayTask(void* pvParameters) {
         LOG_ERROR("Relay OFF → Environment out of range");
       }
 
-    } else if (distanceSnapshot >= config.compressorOnLevel) {
+    } else if (safeDistance >= config.compressorOnLevel) {
 
-      if (lastRelayState != LOW) {
-        if (millis() - lastRelayOffTime >= 180000) { // 3 min hysteresis
-          digitalWrite(RELAY1_PIN, LOW);
-          lastRelayState = LOW;
-          compStartTime = millis();
-          lastMinuteCheck = compStartTime;
-          LOG_ERROR("Relay ON → Compressor started");
-        } else {
-          LOG_ERROR("Relay ON blocked (3 min hysteresis)");
-        }
+      if (lastRelayState != LOW &&
+          millis() - lastRelayOffTime >= 180000) {
+
+        digitalWrite(RELAY1_PIN, LOW);
+        lastRelayState = LOW;
+        compStartTime = millis();
+        lastMinuteCheck = compStartTime;
+        LOG_ERROR("Relay ON → Compressor started");
       }
     }
 
     /* ================= PUMP CONTROL ================= */
 
-    if (distanceSnapshot >= config.pumpOffLevel) {
+    if (safeDistance >= config.pumpOffLevel) {
 
       if (lastPumpState != HIGH) {
         digitalWrite(RELAY2_PIN, HIGH);
@@ -1098,6 +1128,7 @@ void checkRelayTask(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
+
 
 
 ///======== CONNECTIVITY SECTION =======//
@@ -1365,6 +1396,21 @@ void setupCommunication() {
     setupServer();
   }
 }
+bool ensureTimeSynced(uint8_t retries = 5) {
+  time_t now;
+  for (uint8_t i = 0; i < retries; i++) {
+    time(&now);
+    if (now > 1700000000) {
+      return true;
+    }
+
+    LOG_ERROR("Time not synced. Retrying NTP (%d/%d)", i + 1, retries);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    delay(2000);
+  }
+  return false;
+}
+
 ///======== GSM SETUP SECTION =======//
 // GSM modem setup with cert upload (optimized: chunked upload for large certs)
 void setupGSM() {
@@ -1584,7 +1630,10 @@ inline void jsonFloat2(JsonDocument& doc, const char* key, float val) {
 ///======== GSM PUBLISH SECTION =======//
 // Send data via GSM with validation and resets (optimized: null on invalid data)
 void sendViaGSM() {
-
+  if (flowFlag) {
+    LOG_INFO("Flow active — skipping publish to preserve WaterTotalizer");
+    return;
+  }
   /* ================= MQTT CONNECTION CHECK ================= */
   if (!checkMQTTConnection()) {
     LOG_ERROR("MQTT reconnection needed");
@@ -1650,7 +1699,7 @@ void sendViaGSM() {
                : temperatureSnap);
 
   jsonFloat2(doc, "Humidity",
-             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)
+             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)  
                ? NAN
                : humiditySnap);
 
@@ -1920,6 +1969,10 @@ void sendViaWIFI() {
 
   if (WiFi.status() != WL_CONNECTED) {
     LOG_ERROR("WiFi not connected. Reconnection handled by checkConnectivityTask.");
+    return;
+  }
+  if (flowFlag) {
+    LOG_INFO("Flow active — skipping publish to preserve WaterTotalizer");
     return;
   }
 

@@ -105,7 +105,6 @@ unsigned long flowStopDelay = 5000;
 static unsigned long lastFlowTime = 0;
 float sessionLiters = 0.0f;  // counts only this flow session
 // Configuration struct for device settings
-#define ULTRASONIC_FAIL_THRESHOLD 5
 #define SENSOR_RESPONSE_TIMEOUT_MS 200  // 5-140ms typical
 #define SENSOR_BOOT_TIME_MS 1000
 #define MEASUREMENT_INTERVAL_MS 5000  // 5 seconds
@@ -245,7 +244,7 @@ uint8_t AQI = 0;
 uint16_t TVOC = 0, ECO2 = 0;
 bool isENS = true;
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
-const char* current_firmware_version = "2.1.6";
+const char* current_firmware_version = "2.1.7";
 ///======== FORWARD DECLARATIONS SECTION =======//
 // Forward declarations for functions to ensure compilation order
 float readCounter(const char* key, float defaultValue);
@@ -1616,7 +1615,10 @@ inline void jsonFloat2(JsonDocument& doc, const char* key, float val) {
 ///======== GSM PUBLISH SECTION =======//
 // Send data via GSM with validation and resets (optimized: null on invalid data)
 void sendViaGSM() {
-
+  if (flowFlag) {
+    LOG_INFO("Flow active — skipping publish to preserve WaterTotalizer");
+    return;
+  }
   /* ================= MQTT CONNECTION CHECK ================= */
   if (!checkMQTTConnection()) {
     LOG_ERROR("MQTT reconnection needed");
@@ -1682,7 +1684,7 @@ void sendViaGSM() {
                : temperatureSnap);
 
   jsonFloat2(doc, "Humidity",
-             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)
+             (isnan(humiditySnap) || humiditySnap < 1 || humiditySnap > 100)  
                ? NAN
                : humiditySnap);
 
